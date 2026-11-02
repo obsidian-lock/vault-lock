@@ -151,7 +151,7 @@ Details:
   `_manifest.json`, `_trash/`, `_control/` and `_pair/` in the vault, because those names
   are reserved on the server.
 - Status bar: `Backup: syncing…`, `Backup: ✓ 14:05`, `Backup: ⚠ retrying`,
-  `Backup: pairing…`, or `Backup: ⚠ not paired` (the server isn't accepting new computers;
+  `Backup: pairing…`, or `Backup: ⚠ not paired` (pairing is paused or full on the server;
   see [Pairing](#pairing)).
 - Nothing uploads while Obsidian is closed. The reconcile at the next start catches up.
 
@@ -163,30 +163,35 @@ A computer gets its own login on the server without anyone typing a password:
    `data.json`.
 2. It drops a small request into the server's pairing inbox: an id, the computer's name,
    and a bcrypt hash of the key. The key itself never leaves the computer.
-3. While pairing is open, the server accepts the **first** request it sees. That computer
-   gets its own login and its own folder, and pairing closes by itself.
+3. Within 15 seconds the server accepts the request: the computer gets its own login and
+   its own folder. **Every** computer that asks is accepted, so yours can never be blocked
+   by someone else pairing first.
 4. The plugin notices its login works and starts backing up.
 
-Every computer sees only its own folder. If a stranger installs the plugin and pairs while
-pairing is open, they get an empty folder of their own, never your notes, and your
-computer shows `Backup: ⚠ not paired`. Remove theirs and open pairing again.
+Every computer sees only its own folder. If a stranger installs the plugin, they get an
+empty sandbox of their own, never your notes. Strangers are kept cheap: a computer you
+haven't marked with `vlb mine` is frozen (it can read but not write) when its folder grows
+past 10 GB, when all strangers together pass 30 GB, or when the disk has less than 10 GB
+free. Once you have marked your computer, the strangers' folders are also left out of the
+nightly snapshot.
 
 The inbox's login is built into the plugin and is public on purpose. It can only create
-files of up to 4 KB in the inbox, a separate container that can't reach the backups, and
-only while pairing is open.
+files of up to 4 KB in the inbox, a separate container that can't reach the backups.
 
 On the server, `vlb` manages it:
 
 | Command | What it does |
 | --- | --- |
-| `vlb status` | Pairing open or closed, and every paired computer with its folder and last check-in. |
-| `vlb open` | Accept the next computer that asks. |
-| `vlb open --into FOLDER` | The next computer continues an existing folder: a new or reinstalled laptop picks up where the old one left off (and can then use *Restore vault from server*). |
-| `vlb close` | Stop accepting computers. |
-| `vlb remove COMPUTER` | Revoke a computer's login (by id, login or folder). Its folder is kept. That computer goes back to asking to pair. |
+| `vlb status` | Pairing state and every paired computer: yours or stranger, folder, size, frozen or not, last check-in. |
+| `vlb mine COMPUTER` | This computer is yours: never frozen, always in the snapshot. Run it once your computer shows `Backup: ✓`. |
+| `vlb move COMPUTER FOLDER` | That computer continues an existing folder: a new or reinstalled laptop picks up where the old one left off (and can then use *Restore vault from server*). Its login is reset; it pairs again within a minute. |
+| `vlb remove COMPUTER` | Revoke a computer's login and refuse that computer from now on. Its folder is kept. `vlb move` lets it back in. |
+| `vlb close` / `vlb open` | Pause and resume accepting computers. Paused computers keep asking every minute. `vlb open --only NAME` accepts just the computer with that name (for a flood). |
 
-A computer whose login stops working (for example after `vlb remove`) asks to pair again
-every minute, so it reconnects by itself once pairing is open.
+`COMPUTER` is the computer's name (if unique), login, id or folder as `vlb status` shows
+it. A computer whose login stops working (for example after `vlb move`) asks to pair again
+every minute, so it reconnects by itself. At most 100 computers can be paired; beyond that
+new ones are refused until you remove some.
 
 ## Server setup
 
@@ -202,7 +207,7 @@ install -m 755 vlb /usr/local/bin/vlb
 vlb apply --no-restart                 # writes conf/webdav/ and conf/pair/ from state.json
 docker compose up -d
 systemctl daemon-reload && systemctl enable --now vlb-pair.timer   # handles the inbox every 15 s
-vlb open                               # accept the next computer that asks
+vlb status                             # pairing is open from the start
 ```
 
 1. Point a DNS name (for example `vault.example.com`) at the server, and put it in
@@ -216,7 +221,9 @@ vlb open                               # accept the next computer that asks
 Never edit `conf/` by hand: `vlb` regenerates it from `state.json`. Backups land in
 `/opt/obsidian-webdav/data/devices/`. Take a nightly snapshot of `data/`, `conf/` and
 `state.json` to somewhere off the server, for example with restic or
-`tar czf /backups/vault-$(date +%F).tgz data conf state.json`.
+`tar czf /backups/vault-$(date +%F).tgz --exclude-from=snapshot-exclude.txt data conf state.json`
+(`snapshot-exclude.txt` is written by `vlb`: the strangers' folders, once you have run
+`vlb mine`).
 
 ## Controlling the plugin from the server
 
@@ -300,8 +307,9 @@ computer has stopped backing up.
   computer's folder can change its settings and use `pull` to overwrite notes. Local
   versions go to `_trash/` first, but protect the server as carefully as the vault itself.
   Serve it over HTTPS only.
-- The server's address is built into the plugin, so it is public. Pairing is what keeps
-  strangers out: see [Pairing](#pairing).
+- The server's address is built into the plugin, so it is public. Anyone can pair, but
+  every computer gets its own sealed folder, so a stranger gets a small sandbox and never
+  your notes: see [Pairing](#pairing).
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
@@ -310,15 +318,18 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - **Lost passphrase.** Close Obsidian. Delete
   `<vault>/.obsidian/plugins/vault-lock-backup/data.json` and rename `.Private` back to
   `Private`. Obsidian then asks for a new passphrase. Deleting `data.json` also deletes this
-  computer's pairing, so on the server run `vlb remove <old login>` and
-  `vlb open --into <its folder>` first: the computer then pairs again into its old folder.
+  computer's pairing: it pairs again as a new computer with a fresh folder. On the server,
+  `vlb move <new computer> <old folder>` makes it continue the old folder instead.
 - **"Both Private and .Private exist".** This only happens if folders are created by hand.
   The plugin refuses to rename either one. Merge them manually.
 - **Don't keep the vault in OneDrive, iCloud Drive or Dropbox.** A second sync engine
   fighting over the `Private` ↔ `.Private` rename is the one thing that can corrupt this
   setup.
-- **`Backup: ⚠ not paired`.** The server isn't accepting new computers. Run `vlb status`,
-  remove any computer that isn't yours, then `vlb open`. The plugin asks again every minute.
+- **`Backup: ⚠ not paired`.** Pairing is paused on the server (`vlb open` resumes it) or
+  100 computers are paired (`vlb status` says FULL; `vlb remove` strangers). The plugin asks
+  again every minute.
+- **`Backup: ⚠ retrying` with HTTP 403 right after pairing.** The server froze this
+  computer as a stranger over the caps. On the server: `vlb mine <its name>`.
 - **`Backup: ⚠ retrying`.** A notice shows the error, and the plugin retries every minute.
 - **The setup command says "Setup failed".** It prints the reason. Fix it and run the same
   command again.
