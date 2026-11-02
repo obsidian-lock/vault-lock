@@ -3,6 +3,21 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.4.0 — 2026-11-02
+
+The backup is invisible on the computer. Its health is read on the server.
+
+- **No backup interface in Obsidian:** the status bar item, every backup notice, and the
+  *Back up now*, *Reset backup index* and *Restore vault from server* commands are gone.
+  What is left on the computer is the lock screen, the passphrase prompt and the lock
+  settings. The server does what those commands did (`commands.json`: `reset-index`,
+  `restore-all`) and shows the state (`vlb status`).
+- **Failures reach the server:** `_control/status.json` is now also written when a backup
+  fails (if the server can still be reached), with the error. `lastError` is `null` while
+  the backup is healthy. `lastReconcile` gains `at` and `skipped` (files over 100 MB).
+- Server: `vlb status` prints the last error and the skipped files per computer.
+- The developer console still logs every step as `[VLB backup]` and `[VLB pairing]`.
+
 ## 1.3.0 — 2026-11-01
 
 Pairing: install with BRAT, choose a passphrase, and the backup sets itself up. No server

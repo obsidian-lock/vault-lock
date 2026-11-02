@@ -12,9 +12,10 @@ An Obsidian plugin for one person, one computer, and a server you control:
 - **Lock screen.** A passphrase overlay at launch, after a few idle minutes, or on demand.
 - **Private folder.** One folder disappears from Obsidian whenever the vault is locked.
 - **One-way backup.** Every file in the vault is copied to your own WebDAV server as plain
-  files. Nothing on the server is ever deleted.
-- **Server-side control.** The server can change settings, send commands, and read the
-  plugin's health by editing a few JSON files next to the backup. Nothing connects in to
+  files. Nothing on the server is ever deleted. The backup shows nothing in Obsidian: no
+  status, no notices, no commands.
+- **Server-side control.** The server changes settings, sends commands, and reads the
+  plugin's health through a few JSON files next to the backup. Nothing connects in to
   your computer.
 
 > [!IMPORTANT]
@@ -47,8 +48,10 @@ An Obsidian plugin for one person, one computer, and a server you control:
   only make it happen sooner, so a missed event can never cause a missed file.
 - **Plain files.** The backup is your vault as ordinary files. No database and no
   proprietary format, so you can read or restore it with any tool.
-- **Failures are visible.** Errors show in the status bar and retry on their own. Nothing
-  fails silently.
+- **Failures are visible on the server.** After every backup, and when one fails, the
+  plugin reports to `_control/status.json`, which `vlb status` shows; it retries on its
+  own. The computer shows nothing about the backup, so there is nothing to misread or to
+  switch off by accident.
 
 ## Install
 
@@ -83,14 +86,15 @@ only step.** If you close the prompt, it comes back at the next start.
 
 - If Obsidian says community plugins are turned off: *Settings → Community plugins → Turn
   on community plugins*.
-- The backup starts by itself. The status bar shows `Backup: pairing…` for up to a minute
-  the first time, then `Backup: ✓ HH:MM`.
+- The backup starts by itself and shows nothing in Obsidian. On the server, `vlb status`
+  lists the computer within a minute, with its last check-in.
 - To change the passphrase: *Settings → Vault Lock & Backup → Change passphrase*, or the
   *Set or change passphrase* command. It asks for the current one first.
 - Put notes that should disappear while locked in a top-level folder named `Private`.
 
 The plugin's settings are only about the passphrase and the lock. The backup has no
-settings there: it pairs itself with the server and runs by itself.
+settings, status or commands in Obsidian: it pairs itself with the server, runs by itself,
+and is watched and driven from the server.
 
 | Setting | Default |
 | --- | --- |
@@ -110,9 +114,10 @@ Open the command palette (Ctrl/Cmd+P):
 | --- | --- |
 | **Lock vault now** | Locks immediately. Needs a passphrase. |
 | **Set or change passphrase** | Opens the passphrase prompt. |
-| **Back up now** | Runs a full reconcile right away. |
-| **Reset backup index** | Forgets the server index and re-uploads every file. |
-| **Restore vault from server** | Downloads every indexed file that is missing or different locally. Use it for a new computer or a repair. Local copies it overwrites go to `_trash/` on the server first. |
+
+The backup has no commands in Obsidian. A re-upload of everything or a restore from the
+server is sent from the server (`reset-index`, `restore-all`); see
+[Controlling the plugin from the server](#controlling-the-plugin-from-the-server).
 
 ## How the backup works
 
@@ -147,12 +152,13 @@ Details:
 - The private folder is always stored as `Private/` on the server, even while it is hidden
   locally as `.Private/`.
 - Always skipped: the plugin's own `data.json` (it holds your passphrase hash and this
-  computer's server key), files over 100 MB (with a notice), and top-level
+  computer's server key), files over 100 MB (listed in `status.json`), and top-level
   `_manifest.json`, `_trash/`, `_control/` and `_pair/` in the vault, because those names
   are reserved on the server.
-- Status bar: `Backup: syncing…`, `Backup: ✓ 14:05`, `Backup: ⚠ retrying`,
-  `Backup: pairing…`, or `Backup: ⚠ not paired` (pairing is paused on the server; see
-  [Pairing](#pairing)).
+- Health: after every reconcile, and when something fails, the plugin writes
+  `_control/status.json` (last run, last error, skipped files). `vlb status` on the
+  server shows it. In Obsidian nothing is shown; the developer console (Ctrl+Shift+I)
+  logs every step as `[VLB backup]` and `[VLB pairing]`.
 - Nothing uploads while Obsidian is closed. The reconcile at the next start catches up.
 
 ## Pairing
@@ -183,8 +189,8 @@ On the server, `vlb` manages it:
 | Command | What it does |
 | --- | --- |
 | `vlb status` | Pairing state and every paired computer: yours or stranger, folder, size, frozen or not, last check-in. |
-| `vlb mine COMPUTER` | This computer is yours: never frozen, always in the snapshot. Run it once your computer shows `Backup: ✓`. |
-| `vlb move COMPUTER FOLDER` | That computer continues an existing folder: a new or reinstalled laptop picks up where the old one left off (and can then use *Restore vault from server*). Its login is reset; it pairs again within a minute. |
+| `vlb mine COMPUTER` | This computer is yours: never frozen, always in the snapshot. Run it once `vlb status` lists your computer (check its name and user). |
+| `vlb move COMPUTER FOLDER` | That computer continues an existing folder: a new or reinstalled laptop picks up where the old one left off (then send it `restore-all`, see below). Its login is reset; it pairs again within a minute. |
 | `vlb remove COMPUTER` | Revoke a computer's login and refuse that computer from now on. Its folder is kept. `vlb move` lets it back in. |
 | `vlb close` / `vlb open` | Pause and resume accepting computers. Paused computers keep asking every minute. `vlb open --only NAME` accepts just the computer with that name (for a flood). |
 
@@ -229,7 +235,9 @@ Never edit `conf/` by hand: `vlb` regenerates it from `state.json`. Backups land
 
 Everything happens in `_control/` inside the computer's folder (on the server:
 `data/devices/<folder>/_control/`). The plugin reads it at the start of every reconcile (at
-startup and every 10 minutes by default) and writes `status.json` afterwards.
+startup and every 10 minutes by default) and writes `status.json` afterwards, and again
+when a backup fails. This is the only place the backup is seen or steered: the plugin has
+no backup status or commands in Obsidian.
 
 **`config.json`**: any subset of these. The server's value wins and is saved on the
 computer.
@@ -270,14 +278,19 @@ nothing is lost on either side.
 **`status.json`**: written by the plugin.
 
 ```json
-{ "at": "2026-10-29T18:00:00.000Z", "version": "1.3.0", "computer": "LAPTOP", "locked": false,
-  "lastReconcile": { "reason": "interval", "files": 812, "uploaded": 3, "trashed": 0 },
+{ "at": "2026-11-02T18:00:00.000Z", "version": "1.4.0", "computer": "LAPTOP", "locked": false,
+  "lastReconcile": { "at": "2026-11-02T18:00:00.000Z", "reason": "interval",
+                     "files": 812, "uploaded": 3, "trashed": 0, "skipped": [] },
   "lastError": null, "settings": { "idleMinutes": 5, "…": "…" },
-  "commands": { "2026-10-29-d": { "ok": true, "at": "…", "detail": "4 files written" } } }
+  "commands": { "2026-11-02-d": { "ok": true, "at": "…", "detail": "4 files written" } } }
 ```
 
-A cron job on the server can alert you when `at` is older than a day, which means the
-computer has stopped backing up.
+`at` is when the file was written. `lastError` is `null` while the backup is healthy; when
+a backup fails, the plugin writes the file again with the error (if the server can still be
+reached) and retries every minute. `lastReconcile` is the last run that completed since
+Obsidian started (`null` before the first); `skipped` lists files over 100 MB. `vlb status`
+prints all of this per computer. A cron job can alert you when `at` is older than you
+expect, which means the computer has stopped backing up or Obsidian hasn't been opened.
 
 ## Security model
 
@@ -325,13 +338,19 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - **Don't keep the vault in OneDrive, iCloud Drive or Dropbox.** A second sync engine
   fighting over the `Private` ↔ `.Private` rename is the one thing that can corrupt this
   setup.
-- **`Backup: ⚠ not paired`.** Pairing is paused on the server; `vlb open` resumes it. The
-  plugin asks again every minute.
-- **`Backup: pairing…` for more than a couple of minutes.** The server is full (`vlb status`
-  says FULL; `vlb remove` strangers) or `vlb open --only` names another computer.
-- **`Backup: ⚠ retrying` with HTTP 403 right after pairing.** The server froze this
-  computer as a stranger over the caps. On the server: `vlb mine <its name>`.
-- **`Backup: ⚠ retrying`.** A notice shows the error, and the plugin retries every minute.
+- **`vlb status` doesn't list the computer** a minute after Obsidian started with the
+  plugin. Pairing is paused (`vlb open` resumes it), the server is full (`vlb status` says
+  FULL; `vlb remove` strangers), or `vlb open --only` names another computer. The plugin
+  asks again every minute. Otherwise the computer is offline, or community plugins are
+  turned off in Obsidian.
+- **`vlb status` says `never checked in`** although the computer is listed. The plugin
+  can't complete a backup: see the next item, or wait a minute and look again.
+- **`vlb status` says `FROZEN`** for your computer. The server froze it as a stranger over
+  the caps; it can't upload (nor report, so its last check-in stays put). `vlb mine <its
+  name>` unfreezes it for good.
+- **`vlb status` shows another `ERROR`, or the last check-in is old while Obsidian is
+  open.** The plugin retries every minute. The developer console in Obsidian
+  (Ctrl+Shift+I) shows the `[VLB backup]` lines with the details.
 - **The setup command says "Setup failed".** It prints the reason. Fix it and run the same
   command again.
 - **The backup fails right after you create a new DNS name.** Your computer may have cached the

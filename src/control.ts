@@ -1,4 +1,3 @@
-import { Notice } from "obsidian";
 import type VLBPlugin from "./main";
 import type { Backup, Entry } from "./backup";
 import { CmdResult } from "./settings";
@@ -10,7 +9,8 @@ import { computerName } from "./pairing";
  *
  *   config.json    written by the server, read by the plugin every reconcile; server wins
  *   commands.json  [{ id, cmd, paths? }]  executed once each (ids are remembered)
- *   status.json    written by the plugin after every reconcile: version, health, results
+ *   status.json    written by the plugin after every reconcile and on a failure:
+ *                  version, health, last run, command results
  *
  * Nothing connects inbound to the laptop; the plugin polls over the same transport the
  * backup already uses, so if backups work, control works.
@@ -24,27 +24,31 @@ const MAX_DONE = 300;
 const MAX_LOG = 50;
 
 type Command = { id: string; cmd: string; paths?: string[] };
+export type ReconcileSummary = { at: string; reason: string; files: number; uploaded: number; trashed: number; skipped: string[] };
 
 export class Control {
 	configError = "";
+	/** The last reconcile that completed since Obsidian started; null until the first one. */
+	lastReconcile: ReconcileSummary | null = null;
 
 	constructor(private plugin: VLBPlugin, private backup: Backup) {}
 
-	// ---- called by Backup.reconcile ------------------------------------------
+	// ---- called by Backup -----------------------------------------------------
 
 	async pull(): Promise<void> {
 		await this.applyConfig();
 		await this.runCommands();
 	}
 
-	async writeStatus(reconcile: { reason: string; files: number; uploaded: number; trashed: number }): Promise<void> {
+	/** `at` is when this was written; `lastError` is null while the backup is healthy. */
+	async writeStatus(): Promise<void> {
 		const s = this.plugin.settings;
 		const body = {
 			at: new Date().toISOString(),
 			version: this.plugin.manifest.version,
 			computer: computerName(),
 			locked: this.plugin.lock.locked,
-			lastReconcile: reconcile,
+			lastReconcile: this.lastReconcile,
 			lastError: this.backup.lastError || this.configError || null,
 			settings: { idleMinutes: s.idleMinutes, lockOnBlur: s.lockOnBlur, reconcileMinutes: s.reconcileMinutes, excludes: s.excludes.split("\n").filter(Boolean), privateFolder: s.privateFolder },
 			commands: s.commandLog,
@@ -110,7 +114,6 @@ export class Control {
 			for (const k of Object.keys(s.commandLog).slice(0, -MAX_LOG)) delete s.commandLog[k];
 			await this.plugin.saveSettings();
 			console.log(`[VLB control] ${c.cmd} (${c.id}): ${res.ok ? "ok" : "FAILED"} ${res.detail ?? ""}`);
-			new Notice(`Vault backup: remote command "${c.cmd}" ${res.ok ? "done" : "failed"}${res.detail ? " — " + res.detail : ""}`, 8000);
 		}
 	}
 

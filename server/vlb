@@ -25,7 +25,8 @@ Layout under ROOT (/opt/obsidian-webdav):
   vlb.log                    what vlb did
 
 Commands:
-  vlb status                 pairing state and every computer, with size and last check-in
+  vlb status                 pairing state and every computer: size, last check-in, last
+                             error (the plugin shows nothing on the computer itself)
   vlb mine COMPUTER          mark a computer as yours: never frozen, always in the snapshot
   vlb move COMPUTER FOLDER   that computer continues an existing folder (a new or
                              reinstalled laptop picks up an old backup); it pairs again
@@ -369,12 +370,26 @@ def device_id(key):
 
 
 def last_seen(folder):
+    """What the plugin last wrote to _control/status.json (after every backup and on a
+    failure it could still report), or None if it never checked in."""
     try:
         with open(os.path.join(DEVICES, folder, "_control", "status.json")) as f:
             s = json.load(f)
-        return s.get("at") or "?", s.get("version") or "?", s.get("lastError")
+        return s if isinstance(s, dict) else None
     except (OSError, ValueError):
-        return "never", "?", None
+        return None
+
+
+def health_line(s):
+    if not s:
+        return "    never checked in: no backup yet (Obsidian not started, or the plugin can't reach the server)"
+    line = f"    last check-in {s.get('at') or '?'}, plugin {s.get('version') or '?'}"
+    if s.get("lastError"):
+        line += f", ERROR: {s['lastError']} (the plugin retries every minute)"
+    skipped = (s.get("lastReconcile") or {}).get("skipped") or []
+    if skipped:
+        line += f", {len(skipped)} file(s) over 100 MB skipped"
+    return line
 
 
 def cmd_status(state):
@@ -395,19 +410,18 @@ def cmd_status(state):
     else:
         print(f"Computers: {n} of {MAX_DEVICES}" + ("  FULL: new ones are refused" if n >= MAX_DEVICES else ""))
     for d in state["devices"]:
-        seen, version, err = last_seen(d["folder"])
         who = "YOURS" if d.get("mine") else "stranger"
         frozen = f"  FROZEN since {d['frozen']['at']}: {d['frozen']['why']}" if d.get("frozen") else ""
         print(f"- {who}: {d['name']} (user {d['user'] or '?'}, {d['os'] or '?'})  login {d['username']}{frozen}")
         print(f"    folder data/devices/{d['folder']} ({human(folder_size(d['folder']))})  paired {d['pairedAt']}")
-        print(f"    last check-in {seen}, plugin {version}" + (f", error: {err}" if err else ""))
+        print(health_line(last_seen(d["folder"])))
     if state["banned"]:
         print(f"Removed for good: {len(state['banned'])} computer(s) (vlb move lets one back in)")
     for u in state["extraUsers"]:
         print(f"- extra login {u.get('username')} -> {u.get('directory', '/data/devices')}")
     if n and not any(d.get("mine") for d in state["devices"]):
         print("No computer is marked yours yet: caps apply to all, and all are in the snapshot. "
-              "When yours shows Backup: ✓, run: vlb mine <name>")
+              "Find yours above (name and user) and run: vlb mine <name>")
 
 
 def cmd_mine(state, key):

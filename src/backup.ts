@@ -1,8 +1,8 @@
-import { Notice, requestUrl, RequestUrlResponse, TAbstractFile, TFolder } from "obsidian";
+import { requestUrl, RequestUrlResponse, TAbstractFile, TFolder } from "obsidian";
 import type VLBPlugin from "./main";
 import { b64 } from "./crypto";
 import { Control, CONTROL } from "./control";
-import { Pairing, PairState } from "./pairing";
+import { Pairing } from "./pairing";
 import { PAIR_DIR, SERVER_URL } from "./server";
 
 /**
@@ -17,11 +17,15 @@ import { PAIR_DIR, SERVER_URL } from "./server";
  *
  * Nothing runs until this computer is paired with the server (see pairing.ts), unless the
  * setup script wrote a login.
+ *
+ * The backup has no interface on this computer: no status bar item, no notices, no
+ * commands. Its health is reported to the server in `_control/status.json` (after every
+ * reconcile, and on a failure when the server can still be reached) and read there with
+ * `vlb status`. The developer console gets a `[VLB backup]` line for everything.
  */
 
 export type Entry = { m: number; s: number };
 type Manifest = Record<string, Entry>;
-type Status = "off" | "idle" | "syncing" | "error" | PairState;
 
 const MANIFEST = "_manifest.json";
 const TRASH = "_trash";
@@ -47,17 +51,12 @@ export class Backup {
 	private startupTimer: number | null = null;
 	private failed = false;
 	private reconcileQueued = false;
-	private warnedLarge = new Set<string>();
-	private lastOk: Date | null = null;
-	private statusEl: HTMLElement;
 	private stopped = false;
 	private paired = false;
 
 	constructor(private plugin: VLBPlugin) {
-		this.statusEl = plugin.addStatusBarItem();
 		this.control = new Control(plugin, this);
 		this.pairing = new Pairing(plugin, this);
-		this.setStatus("off");
 	}
 
 	/** Runs once this computer has a working login on the server. */
@@ -83,11 +82,9 @@ export class Backup {
 		if (this.stopped) return;
 		if (Pairing.isDeviceLogin(this.plugin.settings.webdavUser)) {
 			// Also covers an already-paired computer: the first check succeeds and starts the backup.
-			this.setStatus("idle");
 			this.pairing.start();
 		} else {
 			this.paired = true; // a login written by the setup script
-			this.setStatus("idle");
 			this.startupTimer = window.setTimeout(() => this.requestReconcile("startup"), STARTUP_DELAY_MS);
 		}
 	}
@@ -97,13 +94,8 @@ export class Backup {
 		if (this.stopped) return;
 		this.paired = true;
 		this.failed = false;
-		this.setStatus("idle");
-		if (newlyPaired) new Notice("Vault backup: this computer is now paired with the backup server. Backing up now.", 8000);
+		if (newlyPaired) console.log("[VLB backup] paired with the server; backing up now");
 		this.requestReconcile(newlyPaired ? "paired" : "startup");
-	}
-
-	setPairState(state: PairState): void {
-		if (!this.paired && !this.stopped) this.setStatus(state);
 	}
 
 	/** Status of a login check, without throwing on HTTP errors. */
@@ -134,24 +126,6 @@ export class Backup {
 		this.manifestLoaded = true;
 		this.manifestDirty = true;
 		this.knownDirs.clear();
-	}
-
-	resetIndex(): void {
-		this.clearIndex();
-		this.failed = false;
-		new Notice("Vault backup: index reset, re-uploading everything.");
-		this.requestReconcile("reset");
-	}
-
-	/** Download every indexed file that is missing or differs locally (new laptop, or repair). */
-	restoreFromServer(): void {
-		this.run(async () => {
-			this.setStatus("syncing");
-			const n = await this.control.restoreAll();
-			await this.flushManifest();
-			this.setStatus("idle");
-			new Notice(`Vault backup: restored ${n} files from the server.`, 8000);
-		}, true);
 	}
 
 	/** Local path for a server path: inside the private folder, that is the hidden name while locked. */
@@ -242,32 +216,39 @@ export class Backup {
 			try {
 				await fn();
 			} catch (e) {
-				this.onFailure(e);
+				await this.onFailure(e);
 			}
 		});
 	}
 
-	private onFailure(e: unknown): void {
-		console.error("[VLB backup]", e);
+	private async onFailure(e: unknown): Promise<void> {
+		console.error("[VLB backup]", e, "— retrying in a minute");
 		if (e instanceof DavError && e.status === 401 && Pairing.isDeviceLogin(this.plugin.settings.webdavUser)) {
 			// The server no longer knows this computer (its login was removed): pair again.
 			this.paired = false;
 			this.failed = false;
 			this.manifestLoaded = false;
 			this.knownDirs.clear();
-			this.setStatus("pairing");
 			this.pairing.start();
 			return;
 		}
+		const first = !this.failed;
 		this.lastError = errMsg(e);
-		if (!this.failed) new Notice("Vault backup: " + errMsg(e) + " — retrying in a minute", 8000);
 		this.failed = true;
-		this.setStatus("error");
 		if (!this.retryTimer) {
 			this.retryTimer = window.setTimeout(() => {
 				this.retryTimer = null;
 				this.requestReconcile("retry");
 			}, RETRY_MS);
+		}
+		// Tell the server, if it can still be reached (a single bad file, a frozen folder):
+		// nothing shows on this computer, so `vlb status` is where the error is read.
+		if (first) {
+			try {
+				await this.control.writeStatus();
+			} catch (e2) {
+				console.log("[VLB backup] could not report the error to the server:", errMsg(e2));
+			}
 		}
 	}
 
@@ -284,7 +265,6 @@ export class Backup {
 
 	private async reconcile(reason: string): Promise<void> {
 		this.failed = false;
-		this.setStatus("syncing");
 		await this.loadManifest();
 		await this.control.pull();
 
@@ -292,9 +272,11 @@ export class Backup {
 		await this.scan("", local);
 
 		let uploaded = 0;
+		const skipped: string[] = [];
 		for (const [sp, info] of local) {
 			const cur = this.manifest[sp];
 			if (cur && cur.m === info.m && cur.s === info.s) continue;
+			if (info.s > MAX_BYTES) { skipped.push(sp); continue; }
 			if (await this.upload(info.path, sp, info.m, info.s)) uploaded++;
 		}
 		let trashed = 0;
@@ -304,11 +286,11 @@ export class Backup {
 			trashed++;
 		}
 		await this.flushManifest();
-		await this.control.writeStatus({ reason, files: local.size, uploaded, trashed });
 		this.lastError = "";
-		this.lastOk = new Date();
-		this.setStatus("idle");
-		console.log(`[VLB backup] reconcile (${reason}): ${local.size} files, ${uploaded} uploaded, ${trashed} trashed`);
+		this.control.lastReconcile = { at: new Date().toISOString(), reason, files: local.size, uploaded, trashed, skipped };
+		await this.control.writeStatus();
+		console.log(`[VLB backup] reconcile (${reason}): ${local.size} files, ${uploaded} uploaded, ${trashed} trashed` +
+			(skipped.length ? `, ${skipped.length} over 100 MB skipped: ${skipped.join(", ")}` : ""));
 	}
 
 	private async scan(dir: string, out: Map<string, { path: string; m: number; s: number }>): Promise<void> {
@@ -342,22 +324,16 @@ export class Backup {
 		const sp = this.serverPath(path);
 		const cur = this.manifest[sp];
 		if (cur && cur.m === st.mtime && cur.s === st.size) return;
-		if (await this.upload(path, sp, st.mtime, st.size)) {
-			this.lastOk = new Date();
-			this.setStatus("idle");
-		}
+		await this.upload(path, sp, st.mtime, st.size);
 	}
 
+	/** False when the file is over the size limit; the next reconcile reports it in status.json. */
 	private async upload(path: string, sp: string, m: number, s: number): Promise<boolean> {
 		if (s > MAX_BYTES) {
-			if (!this.warnedLarge.has(path)) {
-				this.warnedLarge.add(path);
-				new Notice(`Vault backup: skipping ${path} (over 100 MB)`, 8000);
-			}
+			console.log(`[VLB backup] skipping ${path} (over 100 MB)`);
 			return false;
 		}
 		const data = await this.plugin.app.vault.adapter.readBinary(path);
-		this.setStatus("syncing");
 		await this.ensureDir(parentOf(sp));
 		await this.dav("PUT", sp, data, { "Content-Type": "application/octet-stream" });
 		this.manifest[sp] = { m, s };
@@ -479,23 +455,6 @@ export class Backup {
 
 	stamp(): string {
 		return stamp();
-	}
-
-	private setStatus(state: Status): void {
-		const t = this.lastOk ? " " + this.lastOk.toTimeString().slice(0, 5) : "";
-		const text =
-			state === "off" ? "Backup: off" :
-			state === "syncing" ? "Backup: syncing…" :
-			state === "error" ? "Backup: ⚠ retrying" :
-			state === "pairing" ? "Backup: pairing…" :
-			state === "closed" ? "Backup: ⚠ not paired" :
-			"Backup: ✓" + t;
-		this.statusEl.setText(text);
-		this.statusEl.toggleClass("vlb-status-error", state === "error" || state === "closed");
-		this.statusEl.setAttr("aria-label",
-			state === "pairing" ? "Pairing this computer with the backup server" :
-			state === "closed" ? "The server is not accepting new computers. Open pairing on the server: vlb open" :
-			state === "error" ? this.lastError : "");
 	}
 }
 

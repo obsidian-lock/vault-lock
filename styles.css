@@ -40,8 +40,3 @@
 .vlb-locked .titlebar {
 	visibility: hidden;
 }
-
-/* Status bar */
-.vlb-status-error {
-	color: var(--text-error);
-}

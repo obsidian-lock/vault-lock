@@ -25,19 +25,10 @@ export default class VLBPlugin extends Plugin {
 		}
 		this.lock.install();
 
+		// Only the lock has commands. The backup runs by itself and is driven from the
+		// server (_control/commands.json); it shows nothing on this computer.
 		this.addCommand({ id: "lock", name: "Lock vault now", callback: () => void this.lock.lock() });
 		this.addCommand({ id: "change-passphrase", name: "Set or change passphrase", callback: () => new PassphraseModal(this.app, this).open() });
-		this.addCommand({ id: "backup-now", name: "Back up now", callback: () => {
-			if (!this.backup.enabled) { new Notice("Vault backup: this computer isn't paired with the server yet."); return; }
-			this.backup.requestReconcile("manual");
-			new Notice("Backup started");
-		} });
-		this.addCommand({ id: "backup-reset", name: "Reset backup index (re-upload everything)", callback: () => this.backup.resetIndex() });
-		this.addCommand({ id: "backup-restore", name: "Restore vault from server (download missing/changed files)", callback: () => {
-			if (!this.backup.enabled) { new Notice("Vault backup: this computer isn't paired with the server yet."); return; }
-			this.backup.restoreFromServer();
-			new Notice("Restore started");
-		} });
 
 		this.addSettingTab(new VLBSettingTab(this.app, this));
 		this.app.workspace.onLayoutReady(() => {
@@ -70,8 +61,8 @@ class VLBSettingTab extends PluginSettingTab {
 		super(app, plugin);
 	}
 
-	// Only the passphrase and the lock. The backup is set up by the setup script and
-	// runs by itself; the server can change its options through _control/config.json.
+	// Only the passphrase and the lock. The backup pairs itself with the server and runs
+	// by itself; the server changes its options through _control/config.json.
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
