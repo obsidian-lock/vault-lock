@@ -151,8 +151,8 @@ Details:
   `_manifest.json`, `_trash/`, `_control/` and `_pair/` in the vault, because those names
   are reserved on the server.
 - Status bar: `Backup: syncing…`, `Backup: ✓ 14:05`, `Backup: ⚠ retrying`,
-  `Backup: pairing…`, or `Backup: ⚠ not paired` (pairing is paused or full on the server;
-  see [Pairing](#pairing)).
+  `Backup: pairing…`, or `Backup: ⚠ not paired` (pairing is paused on the server; see
+  [Pairing](#pairing)).
 - Nothing uploads while Obsidian is closed. The reconcile at the next start catches up.
 
 ## Pairing
@@ -325,9 +325,10 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - **Don't keep the vault in OneDrive, iCloud Drive or Dropbox.** A second sync engine
   fighting over the `Private` ↔ `.Private` rename is the one thing that can corrupt this
   setup.
-- **`Backup: ⚠ not paired`.** Pairing is paused on the server (`vlb open` resumes it) or
-  100 computers are paired (`vlb status` says FULL; `vlb remove` strangers). The plugin asks
-  again every minute.
+- **`Backup: ⚠ not paired`.** Pairing is paused on the server; `vlb open` resumes it. The
+  plugin asks again every minute.
+- **`Backup: pairing…` for more than a couple of minutes.** The server is full (`vlb status`
+  says FULL; `vlb remove` strangers) or `vlb open --only` names another computer.
 - **`Backup: ⚠ retrying` with HTTP 403 right after pairing.** The server froze this
   computer as a stranger over the caps. On the server: `vlb mine <its name>`.
 - **`Backup: ⚠ retrying`.** A notice shows the error, and the plugin retries every minute.
