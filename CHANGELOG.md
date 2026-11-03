@@ -3,6 +3,31 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.5.1 — 2026-11-03
+
+Fixes from a line-by-line review of the plugin and the server, before daily use.
+
+- **Deleting a folder no longer loses its trash copies.** Nothing in the server's `_trash/`
+  is ever overwritten: a deleted folder's files are moved one by one, and the empty folder
+  that follows is left alone. Renames never overwrite on the server either.
+- **One bad file no longer stops the backup.** A file that cannot be read or stored is
+  reported (`lastReconcile.failed` in `status.json`, shown by `vlb status`) and the others
+  go on. The index is saved every 30 s during a long upload and when a run fails.
+- **Locking saves first.** A private note being typed is saved before its tab is closed.
+- **A damaged `data.json`** (power cut while it was written) no longer opens the vault
+  unlocked or pairs the computer again as a new one: a copy, `data.bak.json`, is kept and
+  restored; the damaged file is set aside.
+- **Pop-out windows** count as activity for the idle lock, and moving between Obsidian's
+  own windows no longer triggers *Lock when the window loses focus*.
+- `restore-all` keeps notes edited on the computer after their last backup.
+- Every request to the server has a time limit, so a stalled connection no longer freezes
+  the backup until restart. A revoked login during a run no longer blocks later runs.
+- The plugin's own folder (which holds the server key) is never backed up.
+- Server: a container restart that fails is retried; the pairing inbox accepts only a
+  pairing `PUT` and stray entries are removed; when all slots are taken the oldest stranger
+  is retired so your own computer always gets in; `vlb move` restores the old folder's files
+  before the first backup; caps are checked every minute; uploads are capped at 110 MB.
+
 ## 1.5.0 — 2026-11-03
 
 Renamed to **Vault Lock**. The backup is a quiet part of the lock now, not half of the name.

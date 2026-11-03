@@ -2,15 +2,26 @@
 # once the DNS name points at this server.
 # Do NOT rewrite the Host header: WebDAV MOVE compares the Destination URL's host with it.
 vault.example.com {
-    # Pairing inbox: tiny requests only.
+    # Pairing inbox: exactly one small PUT of <id>.json gets through, nothing else
+    # (the public pair login must not be able to make folders or anything bigger).
     handle /_pair/* {
+        @notPairing {
+            not {
+                method PUT
+                path_regexp ^/_pair/[a-f0-9]+\.json$
+            }
+        }
+        respond @notPairing 403
         request_body {
             max_size 4KB
         }
         reverse_proxy obsidian-pair:6065
     }
-    # Everything else: the backup.
+    # Everything else: the backup. The plugin never sends a file over 100 MB.
     handle {
+        request_body {
+            max_size 110MB
+        }
         reverse_proxy obsidian-webdav:6065
     }
 }

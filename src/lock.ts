@@ -14,6 +14,7 @@ export class LockScreen {
 	private failedAttempts = 0;
 	/** One title guard per window (main window and pop-outs) while locked. */
 	private titleGuards = new Map<Document, { saved: string; observer: MutationObserver }>();
+	private watched = new WeakSet<Window>();
 
 	constructor(private plugin: VLBPlugin) {}
 
@@ -22,25 +23,42 @@ export class LockScreen {
 	}
 
 	install(): void {
-		const touch = () => { this.lastActivity = Date.now(); };
-		for (const ev of ["mousemove", "mousedown", "keydown", "wheel", "touchstart"] as const) {
-			this.plugin.registerDomEvent(document, ev, touch, { passive: true, capture: true });
-		}
+		this.watchWindow(window);
+		this.plugin.app.workspace.iterateAllLeaves((leaf) => this.watchWindow(leaf.view.containerEl.win));
 		this.plugin.registerInterval(window.setInterval(() => this.checkIdle(), IDLE_CHECK_MS));
-		// Pop-out windows restored or opened while locked get their title hidden too.
+		// Pop-out windows: their activity counts, and ones opened while locked get their title hidden too.
 		this.plugin.registerEvent(this.plugin.app.workspace.on("window-open", (_ww, win) => {
+			this.watchWindow(win);
 			if (this.locked) this.guardTitle(win.document);
 		}));
-		this.plugin.registerDomEvent(window, "blur", () => {
-			if (this.plugin.settings.lockOnBlur) void this.lock();
+	}
+
+	/** Activity, focus loss and the key swallow, per window: a pop-out is its own window whose events never reach the main one. */
+	private watchWindow(win: Window): void {
+		if (this.watched.has(win)) return;
+		this.watched.add(win);
+		const touch = () => { this.lastActivity = Date.now(); };
+		for (const ev of ["mousemove", "mousedown", "keydown", "wheel", "touchstart"] as const) {
+			this.plugin.registerDomEvent(win.document, ev, touch, { passive: true, capture: true });
+		}
+		this.plugin.registerDomEvent(win, "blur", () => {
+			if (!this.plugin.settings.lockOnBlur) return;
+			// Moving between Obsidian's own windows is not leaving Obsidian: look again in a moment.
+			win.setTimeout(() => { if (!this.anyWindowFocused()) void this.lock(); }, 150);
 		});
 		// Belt and braces: while locked, swallow every key that isn't typed into the unlock box.
-		this.plugin.registerDomEvent(window, "keydown", (e: KeyboardEvent) => {
+		this.plugin.registerDomEvent(win, "keydown", (e: KeyboardEvent) => {
 			if (!this.locked) return;
 			if (this.overlay && this.overlay.contains(e.target as Node)) return;
 			e.stopImmediatePropagation();
 			e.preventDefault();
 		}, { capture: true });
+	}
+
+	private anyWindowFocused(): boolean {
+		let focused = document.hasFocus();
+		this.plugin.app.workspace.iterateAllLeaves((leaf) => { if (leaf.view.containerEl.doc.hasFocus()) focused = true; });
+		return focused;
 	}
 
 	private checkIdle(): void {

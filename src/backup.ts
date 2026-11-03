@@ -34,6 +34,8 @@ const DEBOUNCE_MS = 2_000;
 const MANIFEST_FLUSH_MS = 5_000;
 const RETRY_MS = 60_000;
 const STARTUP_DELAY_MS = 8_000;
+const REQUEST_TIMEOUT_MS = 60_000; // plus 1 ms per 100 bytes of body, so a big PUT gets its time
+const FLUSH_EVERY_MS = 30_000; // during a long reconcile, save the index this often
 
 export class Backup {
 	manifest: Manifest = {};
@@ -53,6 +55,7 @@ export class Backup {
 	private reconcileQueued = false;
 	private stopped = false;
 	private paired = false;
+	private trashSeq = 0;
 
 	constructor(private plugin: VLBPlugin) {
 		this.control = new Control(plugin, this);
@@ -101,12 +104,12 @@ export class Backup {
 	/** Status of a login check, without throwing on HTTP errors. */
 	async probe(): Promise<number> {
 		const s = this.plugin.settings;
-		const r = await requestUrl({
+		const r = await withTimeout(requestUrl({
 			url: this.base,
 			method: "PROPFIND",
 			headers: { Authorization: "Basic " + b64(s.webdavUser + ":" + s.webdavPass), Depth: "0" },
 			throw: false,
-		});
+		}), 30_000, "PROPFIND");
 		return r.status;
 	}
 
@@ -191,7 +194,13 @@ export class Backup {
 			if (keys.length === 0) { await this.syncNew(newPath, isFolder); return; }
 
 			await this.ensureDir(parentOf(to));
-			const r = await this.dav("MOVE", from, undefined, { Destination: this.url(to), Overwrite: "T" });
+			let r = await this.dav("MOVE", from, undefined, { Destination: this.url(to), Overwrite: "F" }, [412]);
+			if (r.status === 412) {
+				// Something already sits at the new name on the server: keep it in the trash, never overwrite.
+				await this.moveToTrash(to);
+				for (const k of this.keysUnder(to, isFolder)) delete this.manifest[k];
+				r = await this.dav("MOVE", from, undefined, { Destination: this.url(to), Overwrite: "F" });
+			}
 			for (const k of keys) {
 				this.manifest[to + k.slice(from.length)] = this.manifest[k];
 				delete this.manifest[k];
@@ -209,10 +218,11 @@ export class Backup {
 
 	// ---- queue / failure handling -------------------------------------------
 
-	private run(fn: () => Promise<void>, force = false): void {
+	private run(fn: () => Promise<void>, opts: { force?: boolean; reconcile?: boolean } = {}): void {
 		this.queue = this.queue.then(async () => {
+			if (opts.reconcile) this.reconcileQueued = false; // whether or not it runs now, a new one may be asked for
 			if (!this.enabled) return;
-			if (this.failed && !force) return; // the retry reconcile will cover it
+			if (this.failed && !opts.force) return; // the retry reconcile will cover it
 			try {
 				await fn();
 			} catch (e) {
@@ -245,6 +255,11 @@ export class Backup {
 		// nothing shows on this computer, so `vlb status` is where the error is read.
 		if (first) {
 			try {
+				await this.flushManifest(); // keep the progress made so far
+			} catch (e2) {
+				console.log("[VLB backup] could not save the index to the server:", errMsg(e2));
+			}
+			try {
 				await this.control.writeStatus();
 			} catch (e2) {
 				console.log("[VLB backup] could not report the error to the server:", errMsg(e2));
@@ -255,10 +270,7 @@ export class Backup {
 	requestReconcile(reason: string): void {
 		if (!this.enabled || this.reconcileQueued) return;
 		this.reconcileQueued = true;
-		this.run(async () => {
-			this.reconcileQueued = false;
-			await this.reconcile(reason);
-		}, true);
+		this.run(() => this.reconcile(reason), { force: true, reconcile: true });
 	}
 
 	// ---- the core ------------------------------------------------------------
@@ -273,24 +285,42 @@ export class Backup {
 
 		let uploaded = 0;
 		const skipped: string[] = [];
+		const failed: string[] = []; // one file's trouble never stops the others
+		let lastFlush = Date.now();
 		for (const [sp, info] of local) {
 			const cur = this.manifest[sp];
 			if (cur && cur.m === info.m && cur.s === info.s) continue;
 			if (info.s > MAX_BYTES) { skipped.push(sp); continue; }
-			if (await this.upload(info.path, sp, info.m, info.s)) uploaded++;
+			try {
+				if (await this.upload(info.path, sp, info.m, info.s)) uploaded++;
+			} catch (e) {
+				if (!isPerFile(e)) throw e;
+				failed.push(`${sp}: ${errMsg(e)}`);
+				console.error(`[VLB backup] could not back up ${sp}:`, e);
+			}
+			if (Date.now() - lastFlush > FLUSH_EVERY_MS) { await this.flushManifest(); lastFlush = Date.now(); }
 		}
 		let trashed = 0;
 		for (const sp of Object.keys(this.manifest)) {
 			if (local.has(sp)) continue;
-			await this.trash(sp, false);
-			trashed++;
+			try {
+				await this.trash(sp, false);
+				trashed++;
+			} catch (e) {
+				if (!isPerFile(e)) throw e;
+				failed.push(`${sp}: ${errMsg(e)}`);
+				console.error(`[VLB backup] could not move ${sp} to the trash:`, e);
+			}
 		}
 		await this.flushManifest();
-		this.lastError = "";
-		this.control.lastReconcile = { at: new Date().toISOString(), reason, files: local.size, uploaded, trashed, skipped };
+		this.lastError = failed.length
+			? `${failed.length} file(s) could not be backed up: ${failed.slice(0, 3).join("; ")}${failed.length > 3 ? "; …" : ""}`
+			: "";
+		this.control.lastReconcile = { at: new Date().toISOString(), reason, files: local.size, uploaded, trashed, skipped, failed };
 		await this.control.writeStatus();
 		console.log(`[VLB backup] reconcile (${reason}): ${local.size} files, ${uploaded} uploaded, ${trashed} trashed` +
-			(skipped.length ? `, ${skipped.length} over 100 MB skipped: ${skipped.join(", ")}` : ""));
+			(skipped.length ? `, ${skipped.length} over 100 MB skipped: ${skipped.join(", ")}` : "") +
+			(failed.length ? `, ${failed.length} failed` : ""));
 	}
 
 	private async scan(dir: string, out: Map<string, { path: string; m: number; s: number }>): Promise<void> {
@@ -333,9 +363,22 @@ export class Backup {
 			console.log(`[VLB backup] skipping ${path} (over 100 MB)`);
 			return false;
 		}
-		const data = await this.plugin.app.vault.adapter.readBinary(path);
+		let data: ArrayBuffer;
+		try {
+			data = await this.plugin.app.vault.adapter.readBinary(path);
+		} catch (e) {
+			throw new FileError(`cannot be read: ${errMsg(e)}`);
+		}
 		await this.ensureDir(parentOf(sp));
-		await this.dav("PUT", sp, data, { "Content-Type": "application/octet-stream" });
+		try {
+			await this.dav("PUT", sp, data, { "Content-Type": "application/octet-stream" });
+		} catch (e) {
+			if (!(e instanceof DavError && e.status === 409)) throw e;
+			// A folder we believed in is gone on the server (removed by hand): make them all again, once.
+			this.knownDirs.clear();
+			await this.ensureDir(parentOf(sp));
+			await this.dav("PUT", sp, data, { "Content-Type": "application/octet-stream" });
+		}
 		this.manifest[sp] = { m, s };
 		this.touchManifest();
 		return true;
@@ -344,13 +387,26 @@ export class Backup {
 	private async trash(sp: string, isFolder: boolean): Promise<void> {
 		await this.loadManifest();
 		const keys = this.keysUnder(sp, isFolder);
-		if (keys.length === 0 && !isFolder) return; // never uploaded; nothing to move
-		const dest = `${TRASH}/${stamp()}/${sp}`;
-		await this.ensureDir(parentOf(dest));
-		await this.dav("MOVE", sp, undefined, { Destination: this.url(dest), Overwrite: "T" }); // 404 = already gone
+		// Nothing indexed there means nothing to keep. Obsidian reports a deleted folder's files
+		// before the folder itself, so by the time the folder arrives its files are already in
+		// the trash, and moving the empty folder over them would destroy them.
+		if (keys.length === 0) return;
+		await this.moveToTrash(sp);
 		for (const k of keys) delete this.manifest[k];
 		this.forgetDirs(sp);
 		this.touchManifest();
+	}
+
+	/** MOVE a server path into `_trash/<stamp>/`, never over something already there: nothing in the trash is ever overwritten. */
+	async moveToTrash(sp: string): Promise<void> {
+		for (let attempt = 0; ; attempt++) {
+			const dir = attempt === 0 ? stamp() : `${stamp()}-${Date.now().toString(36)}-${++this.trashSeq}`;
+			const dest = `${TRASH}/${dir}/${sp}`;
+			await this.ensureDir(parentOf(dest));
+			const r = await this.dav("MOVE", sp, undefined, { Destination: this.url(dest), Overwrite: "F" }, [412]); // 404 = already gone
+			if (r.status !== 412) return;
+			if (attempt >= 2) throw new DavError(`MOVE ${sp}: HTTP 412`, 412);
+		}
 	}
 
 	// ---- manifest ------------------------------------------------------------
@@ -421,12 +477,14 @@ export class Backup {
 		}
 	}
 
-	async dav(method: string, sp: string, body?: ArrayBuffer | string, headers: Record<string, string> = {}): Promise<RequestUrlResponse> {
+	async dav(method: string, sp: string, body?: ArrayBuffer | string, headers: Record<string, string> = {}, alsoOk: number[] = []): Promise<RequestUrlResponse> {
 		const s = this.plugin.settings;
 		const h: Record<string, string> = { Authorization: "Basic " + b64(s.webdavUser + ":" + s.webdavPass), ...headers };
-		const r = await requestUrl({ url: this.url(sp), method, headers: h, body, throw: false });
+		const bytes = typeof body === "string" ? body.length : body ? body.byteLength : 0;
+		const r = await withTimeout(requestUrl({ url: this.url(sp), method, headers: h, body, throw: false }), REQUEST_TIMEOUT_MS + bytes / 100, `${method} ${sp}`);
 		const ok =
 			r.status < 300 ||
+			alsoOk.includes(r.status) ||
 			(method === "MKCOL" && r.status === 405) ||
 			(method === "MOVE" && r.status === 404) ||
 			(method === "GET" && r.status === 404);
@@ -441,8 +499,9 @@ export class Backup {
 	}
 
 	private excluded(path: string): boolean {
-		const own = (this.plugin.manifest.dir ?? ".obsidian/plugins/vault-lock") + "/data.json";
-		if (path === own || path === MANIFEST) return true;
+		// The plugin's own folder holds data.json and its copy (passphrase hash, this computer's server key): never uploaded.
+		const own = this.plugin.manifest.dir ?? ".obsidian/plugins/vault-lock";
+		if (path === own || path.startsWith(own + "/") || path === MANIFEST) return true;
 		for (const reserved of [TRASH, CONTROL, PAIR_DIR]) {
 			if (path === reserved || path.startsWith(reserved + "/")) return true;
 		}
@@ -473,10 +532,28 @@ function stamp(): string {
 	return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}_${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`;
 }
 
-class DavError extends Error {
+export class DavError extends Error {
 	constructor(message: string, readonly status: number) {
 		super(message);
 	}
+}
+
+/** A file on this computer that cannot be read (permissions, a lock held by another program). */
+class FileError extends Error {}
+
+/** True when the trouble is with one file, not with the server or the login: skip it and go on. */
+function isPerFile(e: unknown): boolean {
+	if (e instanceof FileError) return true;
+	return e instanceof DavError && e.status >= 400 && e.status < 500 && e.status !== 401 && e.status !== 403;
+}
+
+/** Fail instead of waiting forever on a connection that stays open but never answers. */
+export function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+	let timer = 0;
+	const limit = new Promise<never>((_, reject) => {
+		timer = window.setTimeout(() => reject(new DavError(`${what}: no answer from the server in ${Math.round(ms / 1000)} s`, 0)), ms);
+	});
+	return Promise.race([p, limit]).finally(() => window.clearTimeout(timer));
 }
 
 function errMsg(e: unknown): string {

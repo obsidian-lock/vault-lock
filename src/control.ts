@@ -24,7 +24,8 @@ const MAX_DONE = 300;
 const MAX_LOG = 50;
 
 type Command = { id: string; cmd: string; paths?: string[] };
-export type ReconcileSummary = { at: string; reason: string; files: number; uploaded: number; trashed: number; skipped: string[] };
+/** `skipped`: over 100 MB. `failed`: "path: reason" for files that could not be backed up this time. */
+export type ReconcileSummary = { at: string; reason: string; files: number; uploaded: number; trashed: number; skipped: string[]; failed: string[] };
 
 export class Control {
 	configError = "";
@@ -109,7 +110,8 @@ export class Control {
 				res = { ok: false, at: new Date().toISOString(), detail: e instanceof Error ? e.message : String(e) };
 			}
 			done.add(c.id);
-			s.doneCommands = Array.from(done).slice(-MAX_DONE);
+			// Ids no longer in the file are forgotten, so the cap can never make an old command run again.
+			s.doneCommands = Array.from(done).filter((id) => (list as Command[]).some((x) => x && x.id === id)).slice(-MAX_DONE);
 			s.commandLog[c.id] = res;
 			for (const k of Object.keys(s.commandLog).slice(0, -MAX_LOG)) delete s.commandLog[k];
 			await this.plugin.saveSettings();
@@ -131,7 +133,7 @@ export class Control {
 			case "pull":
 				return `${await this.pullPaths(c.paths ?? [])} files written`;
 			case "restore-all":
-				return `${await this.restoreAll()} files written`;
+				return await this.restoreAll();
 			default:
 				throw new Error("unknown command");
 		}
@@ -150,30 +152,36 @@ export class Control {
 			if (!p) continue;
 			const keys = m[p] ? [p] : Object.keys(m).filter((k) => k.startsWith(p + "/"));
 			if (keys.length === 0) throw new Error(`"${p}" is not in the server index`);
-			for (const k of keys) if (await this.writeFromServer(k, m[k], true)) n++;
+			for (const k of keys) if ((await this.writeFromServer(k, m[k], true)) === "written") n++;
 		}
 		return n;
 	}
 
-	/** Write every indexed file that is missing locally or differs from the index. */
-	async restoreAll(): Promise<number> {
+	/** Write every indexed file that is missing locally or older than the server copy. A note edited here since its last backup is kept. */
+	async restoreAll(): Promise<string> {
 		await this.backup.loadManifest();
-		let n = 0;
+		let written = 0, kept = 0;
 		for (const [sp, e] of Object.entries(this.backup.manifest)) {
-			if (await this.writeFromServer(sp, e, false)) n++;
+			const r = await this.writeFromServer(sp, e, false);
+			if (r === "written") written++;
+			else if (r === "kept") kept++;
 		}
-		return n;
+		return `${written} files written` + (kept ? `, ${kept} newer local files kept` : "");
 	}
 
-	private async writeFromServer(sp: string, e: Entry, force: boolean): Promise<boolean> {
+	private async writeFromServer(sp: string, e: Entry, force: boolean): Promise<"written" | "same" | "kept"> {
 		const adapter = this.plugin.app.vault.adapter;
 		const local = await this.backup.toLocal(sp);
 		const st = await adapter.stat(local);
 		const haveLocal = !!st && st.type === "file";
-		if (!force && haveLocal && st.mtime === e.m && st.size === e.s) return false;
+		if (!force && haveLocal) {
+			if (st.mtime === e.m && st.size === e.s) return "same";
+			if (st.mtime > e.m) return "kept"; // changed on this computer after the last backup: the local note wins
+		}
 
 		const r = await this.backup.dav("GET", sp);
 		if (r.status === 404) throw new Error(`${sp} missing on server`);
+		if (r.arrayBuffer.byteLength !== e.s) throw new Error(`${sp}: the server copy is ${r.arrayBuffer.byteLength} bytes, the index says ${e.s}`);
 
 		if (haveLocal) {
 			// Never lose the local version: park it in the server trash before overwriting.
@@ -187,7 +195,7 @@ export class Control {
 		const st2 = await adapter.stat(local);
 		this.backup.manifest[sp] = { m: st2?.mtime ?? e.m, s: st2?.size ?? e.s };
 		this.backup.touchManifest();
-		return true;
+		return "written";
 	}
 
 	private async mkdirs(dir: string): Promise<void> {

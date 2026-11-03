@@ -1,4 +1,5 @@
 import { requestUrl } from "obsidian";
+import { withTimeout } from "./backup";
 import bcrypt from "bcryptjs";
 import * as os from "os";
 import type VLBPlugin from "./main";
@@ -122,13 +123,13 @@ export class Pairing {
 			os: process.platform,
 			plugin: this.plugin.manifest.version,
 		});
-		const r = await requestUrl({
+		const r = await withTimeout(requestUrl({
 			url: `${SERVER_URL}${PAIR_DIR}/${id}.json`,
 			method: "PUT",
 			headers: { Authorization: "Basic " + b64(PAIR_LOGIN.user + ":" + PAIR_LOGIN.pass), "Content-Type": "application/json" },
 			body,
 			throw: false,
-		});
+		}), 30_000, "pairing request");
 		return r.status;
 	}
 }

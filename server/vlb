@@ -12,7 +12,8 @@ installs the plugin gets an empty sandbox, never your notes.
 Strangers are kept cheap. A computer you haven't marked with `vlb mine` is frozen
 (read-only) when its folder grows past a cap, when all strangers together grow past a cap,
 or when the disk runs low. Once one computer is marked yours, the strangers' folders are
-left out of the nightly snapshot (snapshot-exclude.txt).
+left out of the nightly snapshot (snapshot-exclude.txt). When all slots are taken, the
+oldest stranger is retired (login revoked, folder kept) so your own computer always gets in.
 
 Layout under ROOT (/opt/obsidian-webdav):
   state.json                 source of truth: pairing state, computers, bans, extra users
@@ -30,6 +31,7 @@ Commands:
   vlb mine COMPUTER          mark a computer as yours: never frozen, always in the snapshot
   vlb move COMPUTER FOLDER   that computer continues an existing folder (a new or
                              reinstalled laptop picks up an old backup); it pairs again
+                             and gets the folder's files back before its first backup
   vlb remove COMPUTER        revoke a computer's login and refuse it from now on;
                              its folder is kept (vlb move lets it back in)
   vlb close                  pause: new computers wait (they keep asking every minute)
@@ -39,7 +41,7 @@ Commands:
 
 COMPUTER is a name (if unique), login, id or folder as shown by `vlb status`.
 Caps (env overrides, for tests): VLB_MAX_DEVICES=100 VLB_DEVICE_MAX_MB=10240
-VLB_OTHERS_MAX_MB=30720 VLB_DISK_MIN_FREE_MB=10240 VLB_CHECK_MINUTES=10
+VLB_OTHERS_MAX_MB=30720 VLB_DISK_MIN_FREE_MB=10240 VLB_CHECK_MINUTES=1
 """
 
 import datetime
@@ -74,7 +76,7 @@ MAX_DEVICES = int(os.environ.get("VLB_MAX_DEVICES", "100"))
 DEVICE_MAX = int(os.environ.get("VLB_DEVICE_MAX_MB", "10240")) * MB
 OTHERS_MAX = int(os.environ.get("VLB_OTHERS_MAX_MB", "30720")) * MB
 DISK_MIN_FREE = int(os.environ.get("VLB_DISK_MIN_FREE_MB", "10240")) * MB
-CHECK_SECONDS = float(os.environ.get("VLB_CHECK_MINUTES", "10")) * 60
+CHECK_SECONDS = float(os.environ.get("VLB_CHECK_MINUTES", "1")) * 60
 
 ID_RE = re.compile(r"^[a-f0-9]{16}$")
 HASH_RE = re.compile(r"^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$")
@@ -119,6 +121,15 @@ def write_text(path, text, mode=0o600):
 
 def write_json(path, value, mode=0o600):
     write_text(path, json.dumps(value, indent=2) + "\n", mode)
+
+
+def read_json(path):
+    """The JSON in a file, or None when it is missing or unreadable."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 def load_state():
@@ -186,27 +197,32 @@ def snapshot_exclude(state):
     return "".join(f"data/devices/{d['folder']}\n" for d in state["devices"] if not d.get("mine"))
 
 
+def restart_if_pending(key):
+    """Restart a container whose written config differs from the one it was started with
+    (<config>.applied). A restart that fails or hangs is simply tried again on the next run."""
+    cfg, applied = read_json(CONF[key]), CONF[key] + ".applied"
+    if cfg is None or read_json(applied) == cfg:
+        return
+    try:
+        r = subprocess.run(["docker", "restart", CONTAINER[key]], capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"docker restart {CONTAINER[key]} timed out; retried on the next run")
+    if r.returncode != 0:
+        raise RuntimeError(f"docker restart {CONTAINER[key]} failed: {r.stderr.strip()}; retried on the next run")
+    write_json(applied, cfg)
+    log(f"restarted {CONTAINER[key]}")
+
+
 def apply(state, restart=True):
     """Write the configs; restart a container only when its config changed."""
     wanted = {"webdav": webdav_config(state), "pair": pair_config(state)}
     save_state(state)  # the configs may have added generated passwords
     write_text(EXCLUDE, snapshot_exclude(state))
     for key, cfg in wanted.items():
-        old = None
-        if os.path.exists(CONF[key]):
-            with open(CONF[key]) as f:
-                try:
-                    old = json.load(f)
-                except ValueError:
-                    old = None
-        if old == cfg:
-            continue
-        write_json(CONF[key], cfg)
+        if read_json(CONF[key]) != cfg:
+            write_json(CONF[key], cfg)
         if restart:
-            r = subprocess.run(["docker", "restart", CONTAINER[key]], capture_output=True, text=True)
-            if r.returncode != 0:
-                raise RuntimeError(f"docker restart {CONTAINER[key]} failed: {r.stderr.strip()}")
-            log(f"restarted {CONTAINER[key]}")
+            restart_if_pending(key)
 
 
 # ---- inbox ------------------------------------------------------------------------
@@ -260,48 +276,84 @@ def accept(state, req):
         f"as d-{req['id']} -> data/devices/{folder}" + (" (continued)" if move else ""))
 
 
+def retire_stranger(state):
+    """Make room for one more: revoke the oldest stranger (a frozen one first). Its folder is
+    kept if it holds anything, and its id is refused from now on, so it cannot push the next
+    one out by simply pairing again. Returns False when there is no stranger to retire."""
+    others = [d for d in state["devices"] if not d.get("mine")]
+    if not others:
+        return False
+    d = min(others, key=lambda d: (not d.get("frozen"), d.get("pairedAt", "")))
+    state["devices"].remove(d)
+    if d["id"] not in state["banned"]:
+        state["banned"].append(d["id"])
+    try:
+        os.rmdir(os.path.join(DEVICES, d["folder"]))  # only when empty; data is never deleted
+    except OSError:
+        pass
+    log(f"full: retired the oldest stranger {d['name']} ({d['username']}); folder data/devices/{d['folder']} kept if not empty")
+    return True
+
+
 def process(state):
     before = json.dumps(state, sort_keys=True)
     changed = guards(state)
-    files = []
+    files, junk = [], []
     if os.path.isdir(INBOX):
-        files = [os.path.join(INBOX, n) for n in os.listdir(INBOX)]
-        files = [f for f in files if os.path.isfile(f)]
+        for n in os.listdir(INBOX):
+            f = os.path.join(INBOX, n)
+            (files if os.path.isfile(f) and not os.path.islink(f) else junk).append(f)
         files.sort(key=lambda f: os.path.getmtime(f))
+    for f in junk:  # folders and the like: Caddy only lets a PUT of <id>.json through, but never trust that alone
+        try:
+            if os.path.isdir(f) and not os.path.islink(f):
+                shutil.rmtree(f, ignore_errors=True)
+            else:
+                os.remove(f)
+        except OSError:
+            pass
+    if junk:
+        log(f"removed {len(junk)} stray inbox entries")
     p = state["pairing"]
     if files and not p.get("open"):
         log(f"pairing paused: dropped {len(files)} request(s)")
     elif files:
         paired = {d["id"] for d in state["devices"]}
         banned = set(state["banned"])
-        refused = 0
+        refused = invalid = 0
         for f in files:
             req = read_request(f)
             if req is None:
-                log(f"ignored invalid request {os.path.basename(f)[:40]!r}")
+                invalid += 1
                 continue
             if req["id"] in paired or req["id"] in banned:
                 continue  # already in (asked again after a hiccup), or removed for good
             moving = req["id"] in state["moves"]
-            if p.get("only") and req["name"] != p["only"] and not moving:
+            wanted = bool(p.get("only")) and req["name"] == p["only"]
+            if p.get("only") and not wanted and not moving:
                 continue
-            if len(state["devices"]) >= MAX_DEVICES and not moving:
+            strangers = [d for d in state["devices"] if not d.get("mine")]
+            if len(strangers) >= MAX_DEVICES and not moving and not wanted and not retire_stranger(state):
                 refused += 1
                 continue
             accept(state, req)
             paired.add(req["id"])
             changed = True
+        if invalid:
+            log(f"ignored {invalid} invalid request(s)")
         if refused and time.time() - state.get("fullLoggedAt", 0) > 3600:
             state["fullLoggedAt"] = time.time()
-            log(f"FULL: {MAX_DEVICES} computers paired, refused {refused} request(s). "
-                f"Remove strangers (vlb remove) or raise VLB_MAX_DEVICES.")
+            log(f"FULL: {MAX_DEVICES} strangers paired and none could be retired; refused {refused} request(s).")
     for f in files:
         if os.path.exists(f):
             os.remove(f)
     if changed:
         apply(state)
-    elif json.dumps(state, sort_keys=True) != before:
-        save_state(state)
+    else:
+        if json.dumps(state, sort_keys=True) != before:
+            save_state(state)
+        for key in CONF:
+            restart_if_pending(key)  # a restart that failed earlier
 
 
 # ---- caps -------------------------------------------------------------------------
@@ -450,6 +502,13 @@ def cmd_move(state, key, folder):
     if rid in state["banned"]:
         state["banned"].remove(rid)
     state["moves"][rid] = {"folder": folder, "mine": mine}
+    # The folder's files go back to the computer first; otherwise its first backup would move
+    # everything the computer does not have into the trash.
+    cmds_path = os.path.join(DEVICES, folder, "_control", "commands.json")
+    cmds = read_json(cmds_path)
+    cmds = cmds if isinstance(cmds, list) else []
+    cmds.append({"id": f"move-{rid}-{int(time.time())}", "cmd": "restore-all"})
+    write_json(cmds_path, cmds, mode=0o644)
     apply(state)
     log(f"d-{rid} will continue data/devices/{folder}: it pairs again within a minute"
         + (f"; its folder data/devices/{d['folder']} is kept" if d and d["folder"] != folder else ""))

@@ -58,17 +58,31 @@ export class PrivateFolder {
 			new Notice(`Vault Lock: both "${from}" and "${to}" exist. Merge them by hand.`, 15000);
 			return;
 		}
-		if (hidden) this.closeLeavesUnder(from);
+		if (hidden) await this.closeLeavesUnder(from);
 		await adapter.rename(from, to);
 		this.setWindowsHiddenAttr(to, hidden);
 	}
 
-	private closeLeavesUnder(prefix: string): void {
+	/**
+	 * Close every tab showing a file under `prefix`, after saving what was typed in it. Closing
+	 * alone saves too, but asynchronously, and the folder is renamed right after: that write
+	 * would land on the old path and fail, taking the last seconds of typing with it.
+	 */
+	private async closeLeavesUnder(prefix: string): Promise<void> {
 		const leaves: WorkspaceLeaf[] = [];
 		this.plugin.app.workspace.iterateAllLeaves((leaf) => {
 			const f = (leaf.view as unknown as { file?: TFile }).file;
 			if (f && (f.path === prefix || f.path.startsWith(prefix + "/"))) leaves.push(leaf);
 		});
+		type Saver = { save?: () => Promise<void>; saving?: boolean };
+		const views = leaves.map((l) => l.view as unknown as Saver);
+		for (const v of views) {
+			if (typeof v.save !== "function") continue;
+			try { await v.save(); } catch (e) { console.error("[VLB] saving a private note before the lock failed", e); }
+		}
+		// save() returns at once when a save is already under way; give those a moment to finish.
+		const deadline = Date.now() + 3000;
+		while (views.some((v) => v.saving) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
 		for (const l of leaves) l.detach();
 	}
 
