@@ -11,9 +11,8 @@ automatically.
 
 ## What counts as a vulnerability
 
-The plugin's limits are documented in the README's
-[Security model](README.md#security-model). In short, it is a privacy screen and makes no
-encryption claims. These are known and by design:
+The plugin is a privacy screen and makes no encryption claims. These limits are known and by
+design:
 
 - notes, including the private folder, are readable by anyone with access to the files;
 - deleting the plugin's `data.json` removes the lock;

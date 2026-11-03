@@ -25,8 +25,7 @@ address or password to type, copy or publish.
 
 - **Pairing:** on first start the plugin makes up its own login and key and sends only a
   bcrypt hash of the key to the server's pairing inbox. While pairing is open the server
-  accepts the first computer that asks, gives it its own folder, and closes pairing. See
-  the README's [Pairing](README.md#pairing) section.
+  accepts the first computer that asks, gives it its own folder, and closes pairing.
 - **One folder per computer:** a paired computer sees only its own folder on the server, so
   a stranger who pairs never sees your notes.
 - **Self-healing:** if the server revokes this computer's login, the plugin asks to pair
