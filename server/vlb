@@ -30,6 +30,9 @@ Commands:
                              it connects from, size, last check-in, last error (the
                              plugin shows nothing on the computer itself)
   vlb mine COMPUTER          mark a computer as yours: never frozen, always in the snapshot
+  vlb passphrase COMPUTER    show the copy of that computer's vault passphrase (for the day
+                             it is forgotten). Every paired computer sends one after the
+                             passphrase is set, changed or typed to unlock
   vlb move COMPUTER FOLDER   that computer continues an existing folder (a new or
                              reinstalled laptop picks up an old backup); it pairs again
                              and gets the folder's files back before its first backup
@@ -266,6 +269,12 @@ def unique_folder(state, base):
     return folder
 
 
+def passphrase_copy(folder):
+    """The plugin's copy of the vault passphrase ({passphrase, at, computer}), or None."""
+    c = read_json(os.path.join(DEVICES, folder, "_control", "passphrase.json"))
+    return c if isinstance(c, dict) and isinstance(c.get("passphrase"), str) else None
+
+
 def accept(state, req):
     move = state["moves"].pop(req["id"], None)
     folder = move["folder"] if move else unique_folder(state, f"{req['name']}-{req['id'][:6]}")
@@ -498,6 +507,16 @@ def address_line(ips):
     return line
 
 
+def passphrase_line(folder, s):
+    c = passphrase_copy(folder)
+    if not c:
+        return "    passphrase copy: none yet (sent at its next unlock or passphrase change)"
+    line = f"    passphrase copy: kept, from {c.get('at', '?')} (vlb passphrase shows it)"
+    if s and s.get("passphraseCopied") is False and s.get("at", "") > c.get("at", ""):
+        line += "  NOTE: changed since; the new one arrives at the next unlock"
+    return line
+
+
 def health_line(s):
     if not s:
         return "    never checked in: no backup yet (Obsidian not started, or the plugin can't reach the server)"
@@ -533,7 +552,9 @@ def cmd_status(state):
         print(f"- {who}: {d['name']} (user {d['user'] or '?'}, {d['os'] or '?'})  login {d['username']}{frozen}")
         print(f"    folder data/devices/{d['folder']} ({human(folder_size(d['folder']))})  paired {d['pairedAt']}")
         print(address_line(d.get("ips") or {}))
-        print(health_line(last_seen(d["folder"])))
+        s = last_seen(d["folder"])
+        print(health_line(s))
+        print(passphrase_line(d["folder"], s))
     if state["banned"]:
         print(f"Removed for good: {len(state['banned'])} computer(s) (vlb move lets one back in)")
     for u in state["extraUsers"]:
@@ -551,6 +572,16 @@ def cmd_mine(state, key):
     d["mine"], d["frozen"] = True, None
     apply(state)
     log(f"{d['name']} ({d['username']}) is yours: no caps, always in the snapshot")
+
+
+def cmd_passphrase(state, key):
+    d = find_device(state, key)
+    if not d:
+        sys.exit(f"No paired computer matches {key!r}. See: vlb status")
+    c = passphrase_copy(d["folder"])
+    if not c:
+        sys.exit(f"No passphrase copy from {d['name']} yet; it sends one at its next unlock or passphrase change.")
+    print(f"Passphrase of {d['name']} (copied {c.get('at', '?')}): {c['passphrase']}")
 
 
 def cmd_move(state, key, folder):
@@ -620,6 +651,8 @@ def main(argv):
             cmd_status(state)
         elif cmd == "mine" and len(args) == 1:
             cmd_mine(state, args[0])
+        elif cmd == "passphrase" and len(args) == 1:
+            cmd_passphrase(state, args[0])
         elif cmd == "move" and len(args) == 2:
             cmd_move(state, args[0], args[1])
         elif cmd == "remove" and len(args) == 1:

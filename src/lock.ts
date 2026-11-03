@@ -93,6 +93,7 @@ export class LockScreen {
 		this.failedAttempts = 0;
 		this.locked = false;
 		this.lastActivity = Date.now();
+		this.plugin.backup.control.offerPassphrase(pass);
 		this.removeOverlay();
 		try { await this.plugin.privateFolder.show(); } catch (e) { console.error("[VLB] unhide failed", e); }
 		return true;

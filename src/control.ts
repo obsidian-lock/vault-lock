@@ -11,6 +11,9 @@ import { computerName } from "./pairing";
  *   commands.json  [{ id, cmd, paths? }]  executed once each (ids are remembered)
  *   status.json    written by the plugin after every reconcile and on a failure:
  *                  version, health, last run, command results
+ *   passphrase.json written by the plugin once paired: a copy of the vault passphrase, for
+ *                  the day it is forgotten (`vlb passphrase` shows it). Sent after the
+ *                  passphrase is set, changed or typed to unlock; never kept on disk here.
  *
  * Nothing connects inbound to the laptop; the plugin polls over the same transport the
  * backup already uses, so if backups work, control works.
@@ -20,6 +23,7 @@ export const CONTROL = "_control";
 const CONFIG = `${CONTROL}/config.json`;
 const COMMANDS = `${CONTROL}/commands.json`;
 const STATUS = `${CONTROL}/status.json`;
+const PASSPHRASE = `${CONTROL}/passphrase.json`;
 const MAX_DONE = 300;
 const MAX_LOG = 50;
 
@@ -31,6 +35,8 @@ export class Control {
 	configError = "";
 	/** The last reconcile that completed since Obsidian started; null until the first one. */
 	lastReconcile: ReconcileSummary | null = null;
+	/** The passphrase as typed, held in memory only until the server has its copy. Never written to disk here. */
+	private pendingPass: string | null = null;
 
 	constructor(private plugin: VLBPlugin, private backup: Backup) {}
 
@@ -39,6 +45,7 @@ export class Control {
 	async pull(): Promise<void> {
 		await this.applyConfig();
 		await this.runCommands();
+		await this.sendPassphrase(); // a copy that could not be sent earlier (not paired yet, server unreachable)
 	}
 
 	/** `at` is when this was written; `lastError` is null while the backup is healthy. */
@@ -51,6 +58,7 @@ export class Control {
 			locked: this.plugin.lock.locked,
 			lastReconcile: this.lastReconcile,
 			lastError: this.backup.lastError || this.configError || null,
+			passphraseCopied: !!s.passHash && s.passCopied === s.passHash,
 			settings: { idleMinutes: s.idleMinutes, lockOnBlur: s.lockOnBlur, reconcileMinutes: s.reconcileMinutes, excludes: s.excludes.split("\n").filter(Boolean), privateFolder: s.privateFolder },
 			commands: s.commandLog,
 		};
@@ -84,6 +92,35 @@ export class Control {
 			if (ex !== s.excludes) { s.excludes = ex; changed = true; }
 		}
 		if (changed) await this.plugin.saveSettings();
+	}
+
+	// ---- passphrase copy -------------------------------------------------------
+
+	/** Called with the passphrase as typed (set, changed, or used to unlock). Sends the server
+	 *  a copy unless it has this passphrase already; until that succeeds (not paired yet, or
+	 *  the server is unreachable) it stays in memory and every reconcile tries again. */
+	offerPassphrase(pass: string): void {
+		const s = this.plugin.settings;
+		if (s.passCopied === s.passHash) { this.pendingPass = null; return; }
+		this.pendingPass = pass;
+		void this.sendPassphrase();
+	}
+
+	private async sendPassphrase(): Promise<void> {
+		const pass = this.pendingPass;
+		if (!pass || !this.backup.enabled) return;
+		const s = this.plugin.settings;
+		const hash = s.passHash;
+		try {
+			await this.backup.ensureDir(CONTROL);
+			const body = { passphrase: pass, at: new Date().toISOString(), computer: computerName() };
+			await this.backup.dav("PUT", PASSPHRASE, JSON.stringify(body, null, 2), { "Content-Type": "application/json" });
+			s.passCopied = hash;
+			await this.plugin.saveSettings();
+			if (this.pendingPass === pass) this.pendingPass = null;
+		} catch (e) {
+			console.error("[VLB control] passphrase copy not sent yet; tried again at the next reconcile or unlock", e);
+		}
 	}
 
 	// ---- commands --------------------------------------------------------------

@@ -56,6 +56,7 @@ export class PassphraseModal extends Modal {
 				s.passHash = await hashPass(next, salt);
 				s.passSalt = salt;
 				await this.plugin.saveSettings();
+				this.plugin.backup.control.offerPassphrase(next);
 			} finally {
 				this.busy = false;
 			}

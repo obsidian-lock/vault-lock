@@ -3,6 +3,8 @@ export type CmdResult = { ok: boolean; at: string; detail?: string };
 export interface VLBSettings {
 	passHash: string;
 	passSalt: string;
+	/** The passHash whose passphrase the server has a copy of (see Control.offerPassphrase); "" if none. */
+	passCopied: string;
 	idleMinutes: number;
 	lockOnBlur: boolean;
 	privateFolder: string;
@@ -21,6 +23,7 @@ export interface VLBSettings {
 export const DEFAULT_SETTINGS: VLBSettings = {
 	passHash: "",
 	passSalt: "",
+	passCopied: "",
 	idleMinutes: 5,
 	lockOnBlur: false,
 	privateFolder: "Private",

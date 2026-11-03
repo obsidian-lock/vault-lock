@@ -3,6 +3,14 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.6.0 — 2026-11-03
+
+- The server keeps a copy of the vault passphrase, for the day it is forgotten. Once
+  paired, the plugin sends it over the same connection as the backup after it is set,
+  changed or typed to unlock. The computer never writes it to disk; the server keeps it in
+  `_control/passphrase.json`, and `vlb passphrase` shows it.
+- `vlb status` shows the addresses each computer connects from.
+
 ## 1.5.1 — 2026-11-03
 
 Fixes from a line-by-line review of the plugin and the server, before daily use.
