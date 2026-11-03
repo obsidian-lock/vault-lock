@@ -26,8 +26,9 @@ Layout under ROOT (/opt/obsidian-webdav):
   vlb.log                    what vlb did
 
 Commands:
-  vlb status                 pairing state and every computer: size, last check-in, last
-                             error (the plugin shows nothing on the computer itself)
+  vlb status                 pairing state and every computer: name, user, the addresses
+                             it connects from, size, last check-in, last error (the
+                             plugin shows nothing on the computer itself)
   vlb mine COMPUTER          mark a computer as yours: never frozen, always in the snapshot
   vlb move COMPUTER FOLDER   that computer continues an existing folder (a new or
                              reinstalled laptop picks up an old backup); it pairs again
@@ -82,6 +83,9 @@ ID_RE = re.compile(r"^[a-f0-9]{16}$")
 HASH_RE = re.compile(r"^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$")
 FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_REQUEST = 4096
+MAX_IPS = 20  # addresses remembered per computer
+# hacdias logs every authorized request: "<time> INFO user authorized {"remote_address": ..., "username": ...}"
+AUTH_RE = re.compile(r"^(\S+)\s.*user authorized\s+(\{.*\})\s*$")
 
 
 def now():
@@ -295,9 +299,55 @@ def retire_stranger(state):
     return True
 
 
+def strip_port(addr):
+    m = re.match(r"^\[?([0-9a-fA-F.:]+?)\]?:\d+$", addr or "")
+    return m.group(1) if m and ("." in m.group(1) or "]" in addr) else (addr or "")
+
+
+def track_ips(state):
+    """Remember from which addresses each computer talks to the server. The webdav container
+    logs every authorized request with the client address (the real one; Caddy forwards it)
+    and the login. This reads the lines written since the last run and keeps, per computer
+    and address, the first and last time and a request count. Container logs rotate
+    (docker-compose.yml); what is kept here in state.json does not."""
+    since = state.get("ipsSeenUntil")
+    cmd = ["docker", "logs", CONTAINER["webdav"]] + (["--since", since] if since else [])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return
+    by_login = {d["username"]: d for d in state["devices"]}
+    newest = since or ""
+    for line in (r.stdout + r.stderr).splitlines():
+        m = AUTH_RE.match(line)
+        if not m or m.group(1) <= (since or ""):
+            continue
+        ts = m.group(1)
+        newest = max(newest, ts)
+        try:
+            info = json.loads(m.group(2))
+        except ValueError:
+            continue
+        d = by_login.get(info.get("username"))
+        ip = strip_port(str(info.get("remote_address") or ""))
+        if d is None or not ip:
+            continue
+        ips = d.setdefault("ips", {})
+        e = ips.get(ip)
+        if e:
+            e["last"], e["n"] = ts, e.get("n", 0) + 1
+        else:
+            ips[ip] = {"first": ts, "last": ts, "n": 1}
+        while len(ips) > MAX_IPS:
+            del ips[min(ips, key=lambda k: ips[k]["last"])]
+    if newest != (since or ""):
+        state["ipsSeenUntil"] = newest
+
+
 def process(state):
     before = json.dumps(state, sort_keys=True)
     changed = guards(state)
+    track_ips(state)
     files, junk = [], []
     if os.path.isdir(INBOX):
         for n in os.listdir(INBOX):
@@ -432,6 +482,22 @@ def last_seen(folder):
         return None
 
 
+def short_time(ts):
+    return ts[:19] + "Z" if len(ts) > 20 else ts
+
+
+def address_line(ips):
+    if not ips:
+        return "    address: not seen yet (it has not connected with its own login)"
+    order = sorted(ips.items(), key=lambda kv: kv[1]["last"], reverse=True)
+    ip, e = order[0]
+    line = f"    address {ip} (since {short_time(e['first'])}, last {short_time(e['last'])}, {e['n']} requests)"
+    if len(order) > 1:
+        rest = ", ".join(f"{ip} (last {short_time(e['last'])[:10]})" for ip, e in order[1:4])
+        line += f"\n    earlier addresses: {rest}" + (f" and {len(order) - 4} more" if len(order) > 4 else "")
+    return line
+
+
 def health_line(s):
     if not s:
         return "    never checked in: no backup yet (Obsidian not started, or the plugin can't reach the server)"
@@ -466,6 +532,7 @@ def cmd_status(state):
         frozen = f"  FROZEN since {d['frozen']['at']}: {d['frozen']['why']}" if d.get("frozen") else ""
         print(f"- {who}: {d['name']} (user {d['user'] or '?'}, {d['os'] or '?'})  login {d['username']}{frozen}")
         print(f"    folder data/devices/{d['folder']} ({human(folder_size(d['folder']))})  paired {d['pairedAt']}")
+        print(address_line(d.get("ips") or {}))
         print(health_line(last_seen(d["folder"])))
     if state["banned"]:
         print(f"Removed for good: {len(state['banned'])} computer(s) (vlb move lets one back in)")
@@ -473,7 +540,8 @@ def cmd_status(state):
         print(f"- extra login {u.get('username')} -> {u.get('directory', '/data/devices')}")
     if n and not any(d.get("mine") for d in state["devices"]):
         print("No computer is marked yours yet: caps apply to all, and all are in the snapshot. "
-              "Find yours above (name and user) and run: vlb mine <name>")
+              "Find yours above (name, user and address: on the laptop, search the web for "
+              "'what is my ip' and compare) and run: vlb mine <name>")
 
 
 def cmd_mine(state, key):
