@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Security issues: please don't file them here. Use [private vulnerability reporting](https://github.com/obsidian-lock/vault-lock-backup/security/advisories/new) instead.
+        Security issues: please don't file them here. Use [private vulnerability reporting](https://github.com/obsidian-lock/vault-lock/security/advisories/new) instead.
         Never paste your WebDAV password, URL credentials or the plugin's `data.json`.
   - type: textarea
     id: what

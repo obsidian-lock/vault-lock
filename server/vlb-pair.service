@@ -1,5 +1,5 @@
 [Unit]
-Description=Vault Lock & Backup: accept pairing requests (vlb process)
+Description=Vault Lock: accept pairing requests (vlb process)
 
 [Service]
 Type=oneshot

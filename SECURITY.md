@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report security issues privately through
-[GitHub private vulnerability reporting](https://github.com/obsidian-lock/vault-lock-backup/security/advisories/new),
+[GitHub private vulnerability reporting](https://github.com/obsidian-lock/vault-lock/security/advisories/new),
 not in a public issue.
 
 Only the latest release is supported. Fixes ship as a new release, which BRAT installs

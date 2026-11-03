@@ -1,10 +1,10 @@
-# Vault Lock & Backup: one-time setup on a Windows computer.
+# Vault Lock: one-time setup on a Windows computer.
 #
 # Installs the plugin, plus BRAT, into an Obsidian vault and turns both on. The plugin then
 # pairs itself with the backup server on first start, so the only thing left for the user
 # is choosing a passphrase. Run it in PowerShell:
 #
-#   irm https://raw.githubusercontent.com/obsidian-lock/vault-lock-backup/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/obsidian-lock/vault-lock/main/install.ps1 | iex
 #
 # Optional: set VLB_URL, VLB_USER and VLB_PASS first to use a fixed login instead of
 # pairing. VLB_VAULT picks the vault folder when Obsidian knows several. VLB_NO_LAUNCH=1 skips opening Obsidian at the end. Safe to run again: it
@@ -18,8 +18,8 @@
 	# Windows PowerShell 5.1 can serialize arrays as {"value":[...],"Count":n}; this stops that.
 	Remove-TypeData System.Array -ErrorAction SilentlyContinue
 
-	$PluginRepo = 'obsidian-lock/vault-lock-backup'
-	$PluginId = 'vault-lock-backup'
+	$PluginRepo = 'obsidian-lock/vault-lock'
+	$PluginId = 'vault-lock'
 	$BratRepo = 'TfTHacker/obsidian42-brat'
 	$BratId = 'obsidian42-brat'
 
@@ -103,7 +103,7 @@
 
 		# 1. The plugin, always the latest release.
 		$pluginDir = Join-Path $obsidian "plugins\$PluginId"
-		Write-Host 'Downloading Vault Lock & Backup...'
+		Write-Host 'Downloading Vault Lock...'
 		Install-Release $PluginRepo $pluginDir
 
 		# 2. Its settings: only the server fields are written; the passphrase and the rest are kept.

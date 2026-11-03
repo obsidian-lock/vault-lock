@@ -28,5 +28,5 @@ jobs:
         run: |
           # Release notes = this version's section of CHANGELOG.md, or a one-liner if there is none.
           awk -v v="${GITHUB_REF_NAME}" '/^## /{p = ($2 == v); next} p' CHANGELOG.md > notes.md 2>/dev/null || true
-          [ -s notes.md ] || echo "Vault Lock & Backup ${GITHUB_REF_NAME}" > notes.md
+          [ -s notes.md ] || echo "Vault Lock ${GITHUB_REF_NAME}" > notes.md
           gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file notes.md main.js manifest.json styles.css

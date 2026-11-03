@@ -3,6 +3,16 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.5.0 — 2026-11-03
+
+Renamed to **Vault Lock**. The backup is a quiet part of the lock now, not half of the name.
+
+- Plugin id `vault-lock` (was `vault-lock-backup`) and repository `obsidian-lock/vault-lock`.
+  In BRAT, add `obsidian-lock/vault-lock`. An installation of the old id keeps working but no
+  longer updates: remove it and add the new one (the passphrase is asked for again).
+- Commands are now `vault-lock:lock` and `vault-lock:change-passphrase`.
+- Nothing else changed.
+
 ## 1.4.0 — 2026-11-02
 
 The backup is invisible on the computer. Its health is read on the server.

@@ -14,7 +14,7 @@ $root = Join-Path ([IO.Path]::GetTempPath()) ('vlb-test-' + [guid]::NewGuid())
 $appData = Join-Path $root 'AppData'
 $vault = Join-Path $root 'My Vault'
 $obs = Join-Path $vault '.obsidian'
-$pluginDir = Join-Path $obs 'plugins\vault-lock-backup'
+$pluginDir = Join-Path $obs 'plugins\vault-lock'
 $bratDir = Join-Path $obs 'plugins\obsidian42-brat'
 New-Item -ItemType Directory -Force -Path (Join-Path $appData 'obsidian'), $pluginDir | Out-Null
 
@@ -59,14 +59,14 @@ foreach ($run in 1, 2) {
 	$cp = @(); foreach ($x in ($cpRaw | ConvertFrom-Json)) { $cp += $x }
 	Check ($cpRaw.Trim().StartsWith('[')) 'community-plugins.json is an array'
 	Check ($cp.Count -eq 3) "community-plugins.json has 3 entries (got: $($cp -join ', '))"
-	foreach ($id in 'some-other-plugin', 'vault-lock-backup', 'obsidian42-brat') { Check ($cp -contains $id) "$id is on" }
+	foreach ($id in 'some-other-plugin', 'vault-lock', 'obsidian42-brat') { Check ($cp -contains $id) "$id is on" }
 	Check (-not (Has-Bom $cpPath)) 'community-plugins.json has no BOM'
 
 	$bratRaw = Read-Text (Join-Path $bratDir 'data.json')
 	$brat = $bratRaw | ConvertFrom-Json
 	$list = @(); foreach ($x in $brat.pluginList) { $list += $x }
 	$frozen = @(); foreach ($x in $brat.pluginSubListFrozenVersion) { $frozen += $x }
-	Check ($list.Count -eq 1 -and $list[0] -eq 'obsidian-lock/vault-lock-backup') 'BRAT tracks the plugin once'
+	Check ($list.Count -eq 1 -and $list[0] -eq 'obsidian-lock/vault-lock') 'BRAT tracks the plugin once'
 	Check ($frozen.Count -eq 1 -and $frozen[0].version -eq 'latest') 'BRAT follows the latest release'
 	Check ($brat.updateAtStartup -eq $true) 'BRAT updates at startup'
 	Check ($bratRaw -match '"pluginList":\s*\[') 'BRAT pluginList is an array'

@@ -1,4 +1,4 @@
-# Server side of the Obsidian "Vault Lock & Backup" plugin, in /opt/obsidian-webdav.
+# Server side of the Obsidian "Vault Lock" plugin, in /opt/obsidian-webdav.
 #   webdav: the backup. Each paired computer has its own login and sees only its own
 #           folder, data/devices/<folder>/ (the vault as plain files, _manifest.json,
 #           _trash/, _control/).

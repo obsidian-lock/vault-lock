@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vlb: pairing and computer admin for the Vault Lock & Backup server.
+"""vlb: pairing and computer admin for the Vault Lock server.
 
 How pairing works: on first start the plugin makes up its own random key and drops a small
 request (its id, computer name and a bcrypt hash of the key) into the inbox through the

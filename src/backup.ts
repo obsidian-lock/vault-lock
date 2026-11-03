@@ -441,7 +441,7 @@ export class Backup {
 	}
 
 	private excluded(path: string): boolean {
-		const own = (this.plugin.manifest.dir ?? ".obsidian/plugins/vault-lock-backup") + "/data.json";
+		const own = (this.plugin.manifest.dir ?? ".obsidian/plugins/vault-lock") + "/data.json";
 		if (path === own || path === MANIFEST) return true;
 		for (const reserved of [TRASH, CONTROL, PAIR_DIR]) {
 			if (path === reserved || path.startsWith(reserved + "/")) return true;
