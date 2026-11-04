@@ -4,9 +4,13 @@ import type VLBPlugin from "./main";
 /**
  * The private folder lives at `Private/` while unlocked and `.Private/` while locked.
  * Obsidian ignores dot-folders entirely (explorer, search, graph, switcher), so the
- * rename is the whole hiding mechanism. Nothing is encrypted.
+ * rename is the whole hiding mechanism inside Obsidian. On Windows the folder and everything
+ * in it also get the hidden attribute, so File Explorer skips them. Nothing is encrypted.
  */
 export class PrivateFolder {
+	/** hide() and show() run one at a time, so a quick unlock cannot overtake a lock. */
+	private chain: Promise<void> = Promise.resolve();
+
 	constructor(private plugin: VLBPlugin) {}
 
 	get name(): string {
@@ -39,14 +43,28 @@ export class PrivateFolder {
 		return null;
 	}
 
-	async hide(): Promise<void> {
-		if (!this.enabled) return;
-		await this.rename(this.name, this.hiddenName, true);
+	hide(): Promise<void> {
+		return this.serial(async () => {
+			if (!this.enabled) return;
+			await this.rename(this.name, this.hiddenName, true);
+			// Also when it was hidden already (Obsidian was closed while locked).
+			await this.setWindowsHidden(this.hiddenName, true);
+		});
 	}
 
-	async show(): Promise<void> {
-		if (!this.enabled) return;
-		await this.rename(this.hiddenName, this.name, false);
+	show(): Promise<void> {
+		return this.serial(async () => {
+			if (!this.enabled) return;
+			// Unmark first, while Obsidian still ignores the dot-folder and sees no changes.
+			await this.setWindowsHidden(this.hiddenName, false);
+			await this.rename(this.hiddenName, this.name, false);
+		});
+	}
+
+	private serial(fn: () => Promise<void>): Promise<void> {
+		const run = this.chain.then(fn, fn);
+		this.chain = run.catch(() => {});
+		return run;
 	}
 
 	private async rename(from: string, to: string, hidden: boolean): Promise<void> {
@@ -60,7 +78,6 @@ export class PrivateFolder {
 		}
 		if (hidden) await this.closeLeavesUnder(from);
 		await adapter.rename(from, to);
-		this.setWindowsHiddenAttr(to, hidden);
 	}
 
 	/**
@@ -86,18 +103,34 @@ export class PrivateFolder {
 		for (const l of leaves) l.detach();
 	}
 
-	/** Best effort: also hide from Explorer. Failure is harmless. */
-	private setWindowsHiddenAttr(rel: string, hidden: boolean): void {
+	/**
+	 * Windows only, best effort: set or clear the hidden attribute on the folder and everything
+	 * in it. Failure is harmless: Obsidian ignores the attribute either way.
+	 */
+	private async setWindowsHidden(rel: string, hidden: boolean): Promise<void> {
 		if (!Platform.isWin) return;
+		const adapter = this.plugin.app.vault.adapter;
+		if (!(adapter instanceof FileSystemAdapter)) return;
 		try {
-			const adapter = this.plugin.app.vault.adapter;
-			if (!(adapter instanceof FileSystemAdapter)) return;
+			if (!(await adapter.exists(rel))) return;
 			const abs = adapter.getFullPath(rel);
-			// eslint-disable-next-line @typescript-eslint/no-var-requires
-			const { execFile } = require("child_process") as typeof import("child_process");
-			execFile("attrib", [hidden ? "+h" : "-h", abs], () => {});
+			const flag = hidden ? "+h" : "-h";
+			await attrib([flag, abs]);
+			await attrib([flag, abs + "\\*", "/s", "/d"]);
 		} catch (e) {
 			console.warn("[VLB] attrib failed", e);
 		}
 	}
+}
+
+/** Run Windows' attrib.exe without a console window. Never rejects. */
+function attrib(args: string[]): Promise<void> {
+	const { execFile } = require("child_process") as typeof import("child_process");
+	const exe = (process.env.SystemRoot || "C:\\Windows") + "\\System32\\attrib.exe";
+	return new Promise((resolve) => {
+		execFile(exe, args, { timeout: 30_000, windowsHide: true }, (err) => {
+			if (err) console.warn("[VLB] attrib " + args.join(" ") + " failed", err.message);
+			resolve();
+		});
+	});
 }

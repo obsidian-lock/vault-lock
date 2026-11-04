@@ -24,3 +24,6 @@ jobs:
       - name: Test install.ps1
         shell: powershell
         run: ./scripts/test-install.ps1
+      - name: Test hiding the private folder
+        shell: powershell
+        run: ./scripts/test-hide.ps1

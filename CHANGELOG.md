@@ -3,6 +3,16 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.6.1 — 2026-11-04
+
+- **The private folder is hidden in Windows File Explorer too.** While locked, the folder
+  and every file in it get Windows' hidden attribute (before, only the folder did), so
+  Explorer and its search skip them unless *Hidden items* is switched on. The attribute is
+  also set again when Obsidian starts while locked, and is cleared before unlocking.
+- No console window flashes while this happens, and a quick unlock can no longer overtake
+  a lock that is still finishing.
+- Hiding is not encryption: anyone who shows hidden items can still open the notes.
+
 ## 1.6.0 — 2026-11-03
 
 - The server keeps a copy of the vault passphrase, for the day it is forgotten. Once
