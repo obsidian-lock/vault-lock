@@ -3,7 +3,7 @@ import { HIDE_WAIT_MS, MAX_BYTES, LIFEBOAT_FIRST_MS, LIFEBOAT_INTERVAL_MS } from
 import { API, App, Host } from "../shared/contract";
 import { computerName } from "../shared/computer";
 import { hashPass, safeEqual } from "../shared/crypto";
-import { authFor, dav, DavError, errMsg } from "../shared/dav";
+import { authFor, dav, DavError, errMsg, withTimeout } from "../shared/dav";
 import { PrivateFolder } from "../shared/privateFolder";
 import { CONTROL, excluded, Index, LocalFile, MANIFEST, parentOf, scan } from "../shared/vaultfiles";
 
@@ -265,10 +265,13 @@ export class Lifeboat extends Component implements App {
 			const skipped: string[] = [];
 			const failed: string[] = [];
 			let lastFlush = Date.now();
-			for (const [sp, info] of local) {
-				if (this.stopping) break;
+			// Smallest first: a big file on a slow line never holds up the small ones.
+			const todo = [...local].filter(([sp, info]) => {
 				const cur = index[sp];
-				if (cur && cur.m === info.m && cur.s === info.s) continue;
+				return !(cur && cur.m === info.m && cur.s === info.s);
+			}).sort((a, b) => a[1].s - b[1].s);
+			for (const [sp, info] of todo) {
+				if (this.stopping) break;
 				if (info.s > MAX_BYTES) { skipped.push(sp); continue; }
 				try {
 					const bytes = await adapter.readBinary(info.path);
@@ -287,7 +290,9 @@ export class Lifeboat extends Component implements App {
 					uploaded++;
 				} catch (e) {
 					// The server or the login is the trouble: stop this run. Anything else is this one file.
-					if (this.host.isAborted() || (e instanceof DavError && (e.status === 0 || e.status === 401 || e.status === 403 || e.status >= 500))) throw e;
+					if (this.host.isAborted() || (e instanceof DavError && (e.status === 401 || e.status === 403 || e.status >= 500))) throw e;
+					// No answer in time: the server gone, or only this file too big for the line?
+					if (e instanceof DavError && e.status === 0 && !(await this.serverAnswers())) throw e;
 					failed.push(`${sp}: ${errMsg(e)}`);
 					console.error(`[VLB lifeboat] could not back up ${sp}:`, e);
 				}
@@ -307,6 +312,17 @@ export class Lifeboat extends Component implements App {
 			this.lastError = errMsg(e);
 			console.error("[VLB lifeboat] backup run failed; next one in 10 minutes:", e);
 			try { await this.writeStatus(); } catch { /* the server cannot be reached */ }
+		}
+	}
+
+	/** One cheap request (MKCOL _control: 405 when it is there) with a short limit. */
+	private async serverAnswers(): Promise<boolean> {
+		if (this.stopping || this.host.isAborted()) return false;
+		try {
+			await withTimeout(this.dav("MKCOL", CONTROL + "/"), 30_000, "MKCOL _control");
+			return true;
+		} catch {
+			return false;
 		}
 	}
 

@@ -21,7 +21,7 @@ function pick(more) {
 	return T.pick({ safeMode: false, builtin: B, server: null, bad: {}, now: NOW, ...more });
 }
 
-test("pick: the table of spec C.1", () => {
+test("pick: the precedence table", () => {
 	const S = server("9.9.9");
 	const rows = [
 		["no server", {}, "builtin", "none"],
@@ -108,4 +108,76 @@ test("core.json: missing, damaged or foreign → defaults; partial → merged fi
 	} finally {
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+// ---- server rows: the staged bundle on disk (loadStaged) and its evaluation (evaluateApp) ----
+
+import crypto from "node:crypto";
+
+const KP = crypto.generateKeyPairSync("ed25519");
+const KEY = KP.publicKey.export({ format: "der", type: "spki" }).toString("hex");
+const sha = (b) => crypto.createHash("sha256").update(b).digest("hex");
+function stageFiles(dir, code, more = {}) {
+	const bytes = Buffer.from(code);
+	const p = Buffer.from(JSON.stringify({ v: 1, kind: "app", version: "9.9.9", sha256: sha(bytes), size: bytes.length, force: false, minCore: 1, at: "2026-11-05T12:00:00Z", ...more }));
+	const b = path.join(dir, T.BUNDLES);
+	fs.mkdirSync(b, { recursive: true });
+	fs.writeFileSync(path.join(b, T.STAGED_MANIFEST), JSON.stringify({ payload: p.toString("base64"), sig: crypto.sign(null, p, KP.privateKey).toString("base64") }));
+	fs.writeFileSync(path.join(b, T.bundleName(sha(bytes))), bytes);
+	return { file: path.join(b, T.bundleName(sha(bytes))), sha12: sha(bytes).slice(0, 12) };
+}
+
+test("loadStaged: nothing staged → null; verified only when manifest and bundle both check out", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vlb-staged-"));
+	try {
+		assert.equal(T.loadStaged(dir, [KEY]), null, "no bundles folder");
+		assert.equal(T.loadStaged("", [KEY]), null, "no plugin folder");
+		const code = "module.exports = { API: 1, createApp() { return {}; } };\n";
+		const { file, sha12 } = stageFiles(dir, code);
+		const S = T.loadStaged(dir, [KEY]);
+		assert.equal(S.verified, true, S.why);
+		assert.equal(S.id, "server:" + sha12);
+		assert.equal(S.version, "9.9.9");
+		assert.equal(S.at, "2026-11-05T12:00:00Z");
+		assert.equal(S.code, code, "the verified bytes come with it");
+		assert.equal(T.loadStaged(dir, [crypto.generateKeyPairSync("ed25519").publicKey.export({ format: "der", type: "spki" }).toString("hex")]).verified, false, "another key");
+		// One byte of the bundle changed on disk: never verified, no code.
+		const b = fs.readFileSync(file);
+		b[3] ^= 1;
+		fs.writeFileSync(file, b);
+		const bad = T.loadStaged(dir, [KEY]);
+		assert.equal(bad.verified, false);
+		assert.equal(bad.code, undefined);
+		assert.match(bad.why, /sha256/);
+		fs.writeFileSync(file, Buffer.concat([Buffer.from(code), Buffer.from("x")]));
+		assert.match(T.loadStaged(dir, [KEY]).why, /size/);
+		fs.rmSync(file);
+		assert.match(T.loadStaged(dir, [KEY]).why, /missing/);
+		// The manifest damaged on disk.
+		stageFiles(dir, code);
+		const mf = path.join(dir, T.BUNDLES, T.STAGED_MANIFEST);
+		const env = JSON.parse(fs.readFileSync(mf, "utf8"));
+		const pb = Buffer.from(env.payload, "base64");
+		pb[pb.length - 5] ^= 1;
+		fs.writeFileSync(mf, JSON.stringify({ payload: pb.toString("base64"), sig: env.sig }));
+		const m = T.loadStaged(dir, [KEY]);
+		assert.equal(m.verified, false);
+		assert.match(m.why, /^manifest: signature invalid/);
+		fs.writeFileSync(mf, "{");
+		assert.match(T.loadStaged(dir, [KEY]).why, /^manifest: /);
+		// A core manifest staged as an app is never a candidate.
+		stageFiles(dir, code, { kind: "core" });
+		assert.match(T.loadStaged(dir, [KEY]).why, /core bundle/);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("evaluateApp: the module shape of the contract, with the given require", () => {
+	const mod = T.evaluateApp("const o = require('obsidian'); module.exports = { API: 1, createApp: () => o };", (id) => (id === "obsidian" ? { stub: true } : require(id)));
+	assert.deepEqual(mod.createApp(), { stub: true });
+	assert.throws(() => T.evaluateApp("module.exports = { API: 2, createApp() {} };", require), /API 2/);
+	assert.throws(() => T.evaluateApp("module.exports = { API: 1 };", require), /createApp/);
+	assert.throws(() => T.evaluateApp("module.exports = {", require), SyntaxError);
+	assert.throws(() => T.evaluateApp("throw new Error('top level')", require), /top level/);
 });

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Round trip of signed plugin code: the real server/vlb signs and publishes, and a check that
-# does exactly what the plugin's verifyManifest() and checkBundle() do (B.4) accepts it and
-# refuses any changed byte. When scripts/.build/testable.cjs exists (npm test builds it), the
-# plugin's own verifyManifest() and checkBundle() are run on the same files too.
+# Round trip of signed plugin code: the real server/vlb signs and publishes, and both a check
+# written here from the payload rules and the plugin's own verifyManifest() and checkBundle() (from
+# scripts/.build/testable.cjs, which npm test builds first) accept it and refuse any changed byte.
 #
 # Needs python3, openssl 3 or later and node. Never touches real paths: VLB_ROOT, VLB_KEY_DIR,
 # VLB_ARCHIVE and VLB_RELEASES point into a temp dir, and a fake docker first in PATH records
@@ -112,11 +111,10 @@ if (mode === "flip-payload") {
 	bundle[0] ^= 1;
 }
 const checks = [["this script", verifyManifest, checkBundle]];
-if (testablePath && fs.existsSync(testablePath)) {
-	const t = require(testablePath);
-	// verifyManifest() and checkBundle() arrive with the updater (spec step 4a).
-	if (typeof t.verifyManifest === "function") checks.push(["the plugin's verifyManifest()", t.verifyManifest, t.checkBundle]);
-}
+if (!testablePath || !fs.existsSync(testablePath)) { console.error(`FAIL: ${testablePath} is missing: run node scripts/build-tests.mjs first`); process.exit(1); }
+const t = require(testablePath);
+if (typeof t.verifyManifest !== "function" || typeof t.checkBundle !== "function") { console.error("FAIL: testable.cjs has no verifyManifest/checkBundle"); process.exit(1); }
+checks.push(["the plugin's verifyManifest()", t.verifyManifest, t.checkBundle]);
 for (const [who, verify, check] of checks) {
 	let p;
 	try {

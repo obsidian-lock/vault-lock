@@ -24,11 +24,24 @@ export function basicAuth(auth: DavAuth): string {
 	return "Basic " + b64(auth.user + ":" + auth.pass);
 }
 
-/** One request; throws DavError unless the status is a success for this method. */
+/** Headers for every request. "no-cache": Obsidian's requestUrl goes through Chromium's HTTP
+ *  cache, and the server sends no Cache-Control, so without it a GET of a file only the server
+ *  writes (config.json, commands.json, the update slots) could come from the disk cache for days. */
+export function davHeaders(auth: DavAuth): Record<string, string> {
+	return { Authorization: basicAuth(auth), "Cache-Control": "no-cache" };
+}
+
+/** One request; throws DavError unless the status is a success for this method. No answer at
+ *  all (offline, connection refused, timeout) is DavError status 0. */
 export async function dav(auth: DavAuth, method: string, sp: string, body?: ArrayBuffer | string, headers: Record<string, string> = {}, alsoOk: number[] = []): Promise<RequestUrlResponse> {
-	const h: Record<string, string> = { Authorization: basicAuth(auth), ...headers };
+	const h: Record<string, string> = { ...davHeaders(auth), ...headers };
 	const bytes = typeof body === "string" ? body.length : body ? body.byteLength : 0;
-	const r = await withTimeout(requestUrl({ url: davUrl(auth, sp), method, headers: h, body, throw: false }), REQUEST_TIMEOUT_MS + bytes / 100, `${method} ${sp}`);
+	let r: RequestUrlResponse;
+	try {
+		r = await withTimeout(requestUrl({ url: davUrl(auth, sp), method, headers: h, body, throw: false }), REQUEST_TIMEOUT_MS + bytes / 100, `${method} ${sp}`);
+	} catch (e) {
+		throw e instanceof DavError ? e : new DavError(`${method} ${sp}: ${errMsg(e)}`, 0);
+	}
 	const ok =
 		r.status < 300 ||
 		alsoOk.includes(r.status) ||

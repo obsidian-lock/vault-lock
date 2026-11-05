@@ -117,6 +117,18 @@ export class Backup {
 		return r.status;
 	}
 
+	/** An upload got no answer in time: the server gone (stop the run), or just this file too big
+	 *  for the line (count it as failed and go on)? One cheap request decides. */
+	private async serverAnswers(e: unknown): Promise<boolean> {
+		if (!(e instanceof DavError) || e.status !== 0 || this.stopped || this.owner.host.isAborted()) return false;
+		try {
+			const s = await this.probe();
+			return s >= 200 && s < 300;
+		} catch {
+			return false;
+		}
+	}
+
 	/** Stops at once; resolves when the run in progress has ended (it stops between files) and
 	 *  the index is saved. The core bounds the wait, and once it gives up on this copy every
 	 *  request fails, so the next copy of the plugin is the only one writing. */
@@ -314,15 +326,18 @@ export class Backup {
 		const skipped: string[] = [];
 		const failed: string[] = []; // one file's trouble never stops the others
 		let lastFlush = Date.now();
-		for (const [sp, info] of local) {
-			if (this.stopped) break; // the index is still saved below
+		// Smallest first: a big file on a slow line never holds up the small ones.
+		const todo = [...local].filter(([sp, info]) => {
 			const cur = this.manifest[sp];
-			if (cur && cur.m === info.m && cur.s === info.s) continue;
+			return !(cur && cur.m === info.m && cur.s === info.s);
+		}).sort((a, b) => a[1].s - b[1].s);
+		for (const [sp, info] of todo) {
+			if (this.stopped) break; // the index is still saved below
 			if (info.s > MAX_BYTES) { skipped.push(sp); continue; }
 			try {
 				if (await this.upload(info.path, sp, info.m, info.s)) uploaded++;
 			} catch (e) {
-				if (!isPerFile(e)) throw e;
+				if (!isPerFile(e) && !(await this.serverAnswers(e))) throw e;
 				failed.push(`${sp}: ${errMsg(e)}`);
 				console.error(`[VLB backup] could not back up ${sp}:`, e);
 			}

@@ -677,8 +677,9 @@ def plugin_says(slot, p, s, c):
         inst = as_dict(c.get("coreInstalled"))
         if inst.get("sha12") == sha12:
             return f"installed {inst.get('version')} (runs from the next Obsidian start)"
-    if err.startswith(slot):
-        return err
+    for part in re.split(r"; (?=(?:app|core): )", err):
+        if part.startswith(slot + ":"):
+            return part
     at = str(p.get("at") or "")
     if short_time(str(s.get("at") or "")) < at:
         return f"not yet seen (last check-in {s.get('at') or '?'} is before the publish)"
@@ -1084,8 +1085,7 @@ def cmd_publish(state, args):
             have = version_key(s.get("version"))
             if have and version_key(version) <= have:
                 print(f"NOTE: {d['name']} has plugin {s['version']}; {version} is not newer, so it will "
-                      f"not run there (to run it anyway, publish it with --force before the plugin fetches it, "
-                      f"it checks every 10 minutes; after that only a changed file with --force runs it)")
+                      f"not run there (to run it anyway, publish it again with --force)")
     if failed:
         sys.exit("Could not publish to: " + "; ".join(failed))
     print("The plugin checks within 10 minutes; " + ("it installs main.js and runs it from the next Obsidian start."

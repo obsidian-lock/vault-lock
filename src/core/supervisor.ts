@@ -4,14 +4,16 @@ import {
 } from "../shared/constants";
 import { API, App, CoreStatus, Host, RunningInfo } from "../shared/contract";
 import { authFor, dav, DavError, errMsg, withTimeout } from "../shared/dav";
+import { UPDATE_PUBKEYS } from "../shared/server";
 import type { VLBSettings } from "../shared/settings";
 import { CONTROL } from "../shared/vaultfiles";
 import { createBuiltinApp } from "./builtin";
 import { Cover } from "./cover";
 import { CoreState, defaults, parseCoreConfig, readCoreState, writeCoreState } from "./health";
 import { createLifeboat } from "./lifeboat";
-import { builtinCandidate, Pick, pick, ServerCandidate } from "./loader";
+import { builtinCandidate, evaluateApp, isBad, loadStaged, Pick, pick, ServerCandidate } from "./loader";
 import type VaultLockPlugin from "./main";
+import { Updater } from "./updater";
 
 /**
  * Runs one app at a time and keeps the backup going whatever happens to it:
@@ -21,9 +23,11 @@ import type VaultLockPlugin from "./main";
  * - core.json remembers an app that was starting when Obsidian died (crash loop: twice and
  *   it is skipped for 24 h);
  * - every 10 minutes the core tick reads the server's settings for the core (safe mode,
- *   watchdog), runs the watchdog, and picks again; a different choice is switched to at the
- *   next lock (or at once when the lifeboat or a sick app runs, safe mode is ordered, or no
- *   passphrase is set);
+ *   watchdog), fetches signed plugin code from the server (updater.ts), runs the watchdog,
+ *   and picks again; a different choice is switched to at the next lock (or at once when the
+ *   lifeboat or a sick app runs, safe mode is ordered, or no passphrase is set);
+ * - a server bundle is read from disk and verified again (signature, sha256) every time it is
+ *   considered, and evaluated only from the bytes just verified;
  * - the watchdog: when no backup run has finished for the threshold while the server
  *   provably takes writes (two write probes 9 to 20 minutes apart), the app is marked sick and bad.
  */
@@ -51,6 +55,11 @@ export class Supervisor {
 	state: CoreState = defaults();
 	/** Set while a switch runs; the next switch request waits for it instead. */
 	switching: Promise<void> | null = null;
+	/** Keys that may sign server bundles. Public so the smoke test can use its own key. */
+	keys: string[] = UPDATE_PUBKEYS.slice();
+	/** The staged server bundle as last read by a pick (without its code), for status.json. */
+	lastServer: ServerCandidate | null = null;
+	readonly updater: Updater;
 	readonly cover = new Cover();
 	private host: HostImpl | null = null;
 	/** The app whose start() is still running. */
@@ -66,7 +75,17 @@ export class Supervisor {
 	private firstTickTimer = 0;
 	private intervals: number[] = [];
 
-	constructor(private plugin: VaultLockPlugin) {}
+	constructor(private plugin: VaultLockPlugin) {
+		this.updater = new Updater({
+			pluginDir: () => this.plugin.pluginDir,
+			auth: () => authFor(this.plugin.settings),
+			keys: () => this.keys,
+			req: require,
+			state: () => this.state,
+			save: () => this.save(),
+			alive: () => !this.closed,
+		});
+	}
 
 	get manifest(): PluginManifest {
 		return this.plugin.manifest;
@@ -193,29 +212,35 @@ export class Supervisor {
 		const v = this.manifest.version;
 		if (choice === "builtin") return { ...builtinCandidate(v), kind: "builtin", create: createBuiltinApp };
 		if (choice === "lifeboat") return { id: "lifeboat", kind: "lifeboat", version: v, create: createLifeboat };
-		return null; // server bundles: step 4a
-	}
-
-	/** The staged server bundle, read and verified from disk (step 4a). */
-	private serverCandidate(): ServerCandidate | null {
-		return null;
+		// Read and verified again right now; only these bytes are evaluated (F.2).
+		const S = loadStaged(this.plugin.pluginDir, this.keys);
+		if (!S || !S.verified || S.code === undefined || S.minCore > CORE_VERSION || isBad(this.state.bad, S.id, Date.now())) return null;
+		const code = S.code;
+		return { id: S.id, kind: "server", version: S.version, create: (host) => evaluateApp(code, require).createApp(host) };
 	}
 
 	private choose(): Pick {
+		const S = loadStaged(this.plugin.pluginDir, this.keys);
+		this.lastServer = S ? { ...S, code: undefined } : null;
+		return this.pickWith(this.lastServer);
+	}
+
+	private pickWith(S: ServerCandidate | null): Pick {
 		return pick({
 			safeMode: this.state.config.safeMode,
 			builtin: builtinCandidate(this.manifest.version),
-			server: this.serverCandidate(),
+			server: S,
 			bad: this.state.bad,
 			now: Date.now(),
 			runningId: this.running?.id,
 		});
 	}
 
+	/** The id a pick stands for; for a server bundle, the one choose() just read. */
 	private idOf(p: Pick): string {
 		if (p.choice === "builtin") return builtinCandidate(this.manifest.version).id;
 		if (p.choice === "lifeboat") return "lifeboat";
-		return this.serverCandidate()?.id ?? "server:?";
+		return this.lastServer?.id ?? "server:?";
 	}
 
 	// ---- switch --------------------------------------------------------------------
@@ -274,9 +299,16 @@ export class Supervisor {
 	private async runTick(): Promise<void> {
 		if (this.closed) return;
 		if (this.plugin.settings.webdavUser) {
-			try { await this.pollConfig(); } catch (e) { console.warn("[VLB] core: config.json not read:", errMsg(e)); }
+			let cfg = 0;
+			try { cfg = await this.pollConfig(); } catch (e) { console.warn("[VLB] core: config.json not read:", errMsg(e)); }
 			if (this.closed) return;
-			// (b) server bundles: step 4a
+			// A 404 in an update slot means "unpublished" only while the login provably works.
+			const loginOk = (cfg >= 200 && cfg < 300) || cfg === 404;
+			// (b) server bundles. A newly staged one is picked up by step (d) below.
+			try { await this.updater.pollAppSlot(loginOk); } catch (e) { console.error("[VLB] core: app slot:", e); }
+			if (this.closed) return;
+			try { await this.updater.pollCoreSlot(loginOk); } catch (e) { console.error("[VLB] core: core slot:", e); }
+			if (this.closed) return;
 			try { await this.watchdog(); } catch (e) { console.error("[VLB] watchdog:", e); }
 			if (this.closed) return;
 		}
@@ -440,6 +472,13 @@ export class Supervisor {
 	coreStatus(): CoreStatus {
 		const r = this.running;
 		const st = this.state;
+		// No disk reads here (it runs at every status write): the bundle as the last pick read it.
+		const S = this.lastServer;
+		let server: CoreStatus["server"] = null;
+		if (S) {
+			const p = this.pickWith(S);
+			server = { version: S.version, sha12: S.sha256.slice(0, 12), force: S.force, minCore: S.minCore, state: p.serverState, why: p.why, at: S.at };
+		}
 		return {
 			coreVersion: CORE_VERSION,
 			running: r?.kind ?? "builtin",
@@ -447,7 +486,7 @@ export class Supervisor {
 			runningVersion: r?.version ?? "",
 			startedAt: this.startedAt ? iso(this.startedAt) : "",
 			builtin: this.manifest.version,
-			server: null, // step 4a
+			server,
 			pending: this.pending?.choice ?? null,
 			bad: JSON.parse(JSON.stringify(st.bad)),
 			lastGood: st.lastGood,
