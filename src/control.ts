@@ -58,6 +58,7 @@ export class Control {
 			locked: this.plugin.lock.locked,
 			lastReconcile: this.lastReconcile,
 			lastError: this.backup.lastError || this.configError || null,
+			configError: this.configError || null,
 			passphraseCopied: !!s.passHash && s.passCopied === s.passHash,
 			settings: { idleMinutes: s.idleMinutes, lockOnBlur: s.lockOnBlur, reconcileMinutes: s.reconcileMinutes, excludes: s.excludes.split("\n").filter(Boolean), privateFolder: s.privateFolder },
 			commands: s.commandLog,
@@ -168,7 +169,7 @@ export class Control {
 				await this.plugin.lock.lock();
 				return "locked";
 			case "pull":
-				return `${await this.pullPaths(c.paths ?? [])} files written`;
+				return await this.pullPaths(c.paths ?? []);
 			case "restore-all":
 				return await this.restoreAll();
 			default:
@@ -179,34 +180,57 @@ export class Control {
 	// ---- server -> vault -------------------------------------------------------
 
 	/** Write the server's copy of each path (file or folder) into the vault, unconditionally. */
-	async pullPaths(paths: string[]): Promise<number> {
+	async pullPaths(paths: string[]): Promise<string> {
 		await this.backup.loadManifest();
 		const m = this.backup.manifest;
-		let n = 0;
+		let n = 0, refused = 0;
 		for (const raw of paths) {
 			if (typeof raw !== "string") continue;
 			const p = raw.replace(/^\/+|\/+$/g, "");
 			if (!p) continue;
 			const keys = m[p] ? [p] : Object.keys(m).filter((k) => k.startsWith(p + "/"));
 			if (keys.length === 0) throw new Error(`"${p}" is not in the server index`);
-			for (const k of keys) if ((await this.writeFromServer(k, m[k], true)) === "written") n++;
+			for (const k of keys) {
+				const r = await this.writeFromServer(k, m[k], true);
+				if (r === "written") n++;
+				else if (r === "refused") refused++;
+			}
 		}
-		return n;
+		return `${n} files written` + (refused ? `, ${refused} plugin files refused` : "");
 	}
 
 	/** Write every indexed file that is missing locally or older than the server copy. A note edited here since its last backup is kept. */
 	async restoreAll(): Promise<string> {
 		await this.backup.loadManifest();
-		let written = 0, kept = 0;
+		let written = 0, kept = 0, refused = 0;
 		for (const [sp, e] of Object.entries(this.backup.manifest)) {
+			if (!this.backup.enabled) throw new Error(`stopped (plugin reloaded or closed) after ${written} files; send restore-all again`);
 			const r = await this.writeFromServer(sp, e, false);
 			if (r === "written") written++;
 			else if (r === "kept") kept++;
+			else if (r === "refused") refused++;
 		}
-		return `${written} files written` + (kept ? `, ${kept} newer local files kept` : "");
+		return `${written} files written` + (kept ? `, ${kept} newer local files kept` : "") + (refused ? `, ${refused} plugin files refused` : "");
 	}
 
-	private async writeFromServer(sp: string, e: Entry, force: boolean): Promise<"written" | "same" | "kept"> {
+	/** Plugin code never comes from the server: inside the plugins folder only data.json files
+	 *  are written, and nothing in this plugin's own folder. Paths are compared as Windows reads them. */
+	private refused(sp: string): boolean {
+		if (/[\\:]/.test(sp)) return true;
+		const parts = canon(sp);
+		if (parts.some((p) => !p)) return true; // "", ".", "..": could point anywhere
+		// A Windows short name (".obsidian" -> "OBSIDI~1") opens the same folder: count it as a match.
+		const under = (dir: string) => canon(dir).every((p, i) => parts[i] === p || /~\d/.test(parts[i] ?? ""));
+		const plugins = this.plugin.app.vault.configDir + "/plugins";
+		if (under(this.plugin.manifest.dir ?? plugins + "/vault-lock")) return true;
+		return under(plugins) && parts[parts.length - 1] !== "data.json";
+	}
+
+	private async writeFromServer(sp: string, e: Entry, force: boolean): Promise<"written" | "same" | "kept" | "refused"> {
+		if (this.refused(sp)) {
+			console.warn(`[VLB control] not written: ${sp} (plugin code is never taken from the server)`);
+			return "refused";
+		}
 		const adapter = this.plugin.app.vault.adapter;
 		const local = await this.backup.toLocal(sp);
 		const st = await adapter.stat(local);
@@ -249,4 +273,9 @@ export class Control {
 function parentOf(p: string): string {
 	const i = p.lastIndexOf("/");
 	return i < 0 ? "" : p.slice(0, i);
+}
+
+/** Path parts the way Windows compares them: any case, trailing dots and spaces dropped. */
+function canon(p: string): string[] {
+	return p.split("/").map((s) => s.replace(/[. ]+$/, "").toLowerCase());
 }

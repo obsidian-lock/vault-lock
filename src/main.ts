@@ -39,7 +39,7 @@ export default class VLBPlugin extends Plugin {
 	}
 
 	onunload(): void {
-		this.backup.stop();
+		void this.backup.stop(); // a new copy of the plugin waits for it (see Backup.begin)
 		this.lock.destroy();
 	}
 

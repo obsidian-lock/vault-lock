@@ -3,6 +3,24 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.6.2 — 2026-11-05
+
+Fixes that keep the backup running whatever happens on the computer.
+
+- **One failure can no longer pause the backup until Obsidian restarts.** An error while
+  handling a failed run no longer skips every later one, and a start that fails (for
+  example when the settings file cannot be saved) is tried again every minute.
+- **Server settings and commands never hold up the backup.** If they cannot be applied
+  (disk full, a file locked by antivirus), the files are still backed up and the problem
+  is reported in `status.json` (`configError`).
+- **Plugin code is never written from the server.** `restore-all` and `pull` bring back
+  other plugins' settings (`data.json`) but not their code, and nothing in this plugin's
+  own folder; the files left out are counted in the command's result. After a full
+  restore, reinstall other plugins from Obsidian.
+- **An update no longer runs two backups at once.** When BRAT reloads the plugin, the old
+  copy stops between files and saves the index, and the new one waits for it (at most
+  30 s). A `restore-all` cut short this way is reported as failed, so it can be sent again.
+
 ## 1.6.1 — 2026-11-04
 
 - **The private folder is hidden in Windows File Explorer too.** While locked, the folder

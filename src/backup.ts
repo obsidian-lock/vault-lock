@@ -36,6 +36,12 @@ const RETRY_MS = 60_000;
 const STARTUP_DELAY_MS = 8_000;
 const REQUEST_TIMEOUT_MS = 60_000; // plus 1 ms per 100 bytes of body, so a big PUT gets its time
 const FLUSH_EVERY_MS = 30_000; // during a long reconcile, save the index this often
+const STOP_WAIT_MS = 30_000; // how long a stopping copy of the plugin may take to finish its run
+
+declare global {
+	// Set by stop(): a new copy of the plugin (after a BRAT update) waits for the old one's run to end.
+	interface Window { __vaultLockStopping?: Promise<void> }
+}
 
 export class Backup {
 	manifest: Manifest = {};
@@ -81,14 +87,28 @@ export class Backup {
 	}
 
 	private async begin(): Promise<void> {
-		await this.pairing.ensureIdentity();
+		// After a reload (a BRAT update) the old copy may still be finishing a run: let it end first.
+		const prev = window.__vaultLockStopping;
+		if (prev) {
+			await prev; // never rejects, and gives up after 30 s
+			if (window.__vaultLockStopping === prev) delete window.__vaultLockStopping;
+		}
 		if (this.stopped) return;
-		if (Pairing.isDeviceLogin(this.plugin.settings.webdavUser)) {
-			// Also covers an already-paired computer: the first check succeeds and starts the backup.
-			this.pairing.start();
-		} else {
-			this.paired = true; // a login written by the setup script
-			this.startupTimer = window.setTimeout(() => this.requestReconcile("startup"), STARTUP_DELAY_MS);
+		try {
+			await this.pairing.ensureIdentity();
+			if (this.stopped) return;
+			if (Pairing.isDeviceLogin(this.plugin.settings.webdavUser)) {
+				// Also covers an already-paired computer: the first check succeeds and starts the backup.
+				this.pairing.start();
+			} else {
+				this.paired = true; // a login written by the setup script
+				this.startupTimer = window.setTimeout(() => this.requestReconcile("startup"), STARTUP_DELAY_MS);
+			}
+		} catch (e) {
+			// For example data.json cannot be saved (disk full): try again until it works.
+			if (this.stopped) return;
+			console.error("[VLB backup] could not start:", e, "— trying again in a minute");
+			this.startupTimer = window.setTimeout(() => void this.begin(), RETRY_MS);
 		}
 	}
 
@@ -113,7 +133,9 @@ export class Backup {
 		return r.status;
 	}
 
-	stop(): void {
+	/** Stops at once; the promise resolves when the run in progress has ended (it stops between
+	 *  files), or after 30 s. Kept in window.__vaultLockStopping for the next copy of the plugin. */
+	stop(): Promise<void> {
 		this.stopped = true;
 		this.pairing.stop();
 		for (const t of this.pending.values()) window.clearTimeout(t);
@@ -121,6 +143,13 @@ export class Backup {
 		for (const t of [this.manifestTimer, this.retryTimer, this.intervalTimer, this.startupTimer]) {
 			if (t) window.clearTimeout(t);
 		}
+		const mine = withTimeout(this.queue.catch(() => {}), STOP_WAIT_MS, "last backup run")
+			.catch(() => console.warn("[VLB backup] the last run had not ended 30 s after stopping"));
+		// Two reloads in a row: the next copy must also wait for a run of the copy before this one.
+		const prev = window.__vaultLockStopping;
+		const done = prev ? Promise.all([prev, mine]).then(() => {}) : mine;
+		window.__vaultLockStopping = done;
+		return done;
 	}
 
 	/** Forget the server index; the next reconcile re-uploads every file. */
@@ -142,6 +171,7 @@ export class Backup {
 	}
 
 	scheduleInterval(): void {
+		if (this.stopped) return; // a stopped copy (after a reload) must not re-arm its timer
 		if (this.intervalTimer) window.clearTimeout(this.intervalTimer);
 		const min = Math.max(1, this.plugin.settings.reconcileMinutes || 10);
 		this.intervalTimer = window.setTimeout(() => {
@@ -219,20 +249,26 @@ export class Backup {
 	// ---- queue / failure handling -------------------------------------------
 
 	private run(fn: () => Promise<void>, opts: { force?: boolean; reconcile?: boolean } = {}): void {
-		this.queue = this.queue.then(async () => {
+		// Nothing may break the chain: after a rejected job every later one would be skipped until restart.
+		this.queue = this.queue.catch(() => {}).then(async () => {
 			if (opts.reconcile) this.reconcileQueued = false; // whether or not it runs now, a new one may be asked for
 			if (!this.enabled) return;
 			if (this.failed && !opts.force) return; // the retry reconcile will cover it
 			try {
 				await fn();
 			} catch (e) {
-				await this.onFailure(e);
+				try {
+					await this.onFailure(e);
+				} catch (e2) {
+					console.error("[VLB backup] could not handle the failure:", e2);
+				}
 			}
 		});
 	}
 
 	private async onFailure(e: unknown): Promise<void> {
 		console.error("[VLB backup]", e, "— retrying in a minute");
+		if (this.stopped) return; // a newer copy of the plugin takes over
 		if (e instanceof DavError && e.status === 401 && Pairing.isDeviceLogin(this.plugin.settings.webdavUser)) {
 			// The server no longer knows this computer (its login was removed): pair again.
 			this.paired = false;
@@ -278,7 +314,13 @@ export class Backup {
 	private async reconcile(reason: string): Promise<void> {
 		this.failed = false;
 		await this.loadManifest();
-		await this.control.pull();
+		try {
+			await this.control.pull();
+		} catch (e) {
+			// Server settings and commands never hold up the backup (data.json not saved: disk full, antivirus lock).
+			this.control.configError = `config or commands not applied: ${errMsg(e)}`;
+			console.warn("[VLB backup] config or commands not applied; backing up anyway:", e);
+		}
 
 		const local = new Map<string, { path: string; m: number; s: number }>();
 		await this.scan("", local);
@@ -288,6 +330,7 @@ export class Backup {
 		const failed: string[] = []; // one file's trouble never stops the others
 		let lastFlush = Date.now();
 		for (const [sp, info] of local) {
+			if (this.stopped) break; // the index is still saved below
 			const cur = this.manifest[sp];
 			if (cur && cur.m === info.m && cur.s === info.s) continue;
 			if (info.s > MAX_BYTES) { skipped.push(sp); continue; }
@@ -302,6 +345,7 @@ export class Backup {
 		}
 		let trashed = 0;
 		for (const sp of Object.keys(this.manifest)) {
+			if (this.stopped) break;
 			if (local.has(sp)) continue;
 			try {
 				await this.trash(sp, false);
@@ -313,6 +357,7 @@ export class Backup {
 			}
 		}
 		await this.flushManifest();
+		if (this.stopped) return; // the next copy of the plugin reports
 		this.lastError = failed.length
 			? `${failed.length} file(s) could not be backed up: ${failed.slice(0, 3).join("; ")}${failed.length > 3 ? "; …" : ""}`
 			: "";

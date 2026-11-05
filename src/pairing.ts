@@ -52,7 +52,13 @@ export class Pairing {
 		if (s.webdavUser || s.webdavPass) return;
 		s.webdavUser = "d-" + randomHex(8);
 		s.webdavPass = randomHex(32);
-		await this.plugin.saveSettings();
+		try {
+			await this.plugin.saveSettings();
+		} catch (e) {
+			// Never pair with a login that is not on disk: the next start would pair again as a new computer.
+			s.webdavUser = s.webdavPass = "";
+			throw e;
+		}
 	}
 
 	start(firstDelay = FIRST_CHECK_MS): void {

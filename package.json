@@ -1,6 +1,6 @@
 {
   "name": "vault-lock",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Obsidian plugin: passphrase lock screen, a private folder hidden while locked, and a one-way WebDAV backup.",
   "keywords": [
     "obsidian",
