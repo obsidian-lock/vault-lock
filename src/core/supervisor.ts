@@ -60,7 +60,7 @@ export class Supervisor {
 	/** The staged server bundle as last read by a pick (without its code), for status.json. */
 	lastServer: ServerCandidate | null = null;
 	readonly updater: Updater;
-	readonly cover = new Cover();
+	readonly cover = new Cover(() => this.plugin.app);
 	private host: HostImpl | null = null;
 	/** The app whose start() is still running. */
 	private inflight: { app: App | null; host: HostImpl } | null = null;

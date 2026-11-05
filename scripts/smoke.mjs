@@ -294,10 +294,19 @@ function makeVault(data, coreJson) {
 	const app = {
 		vault: { adapter: new FileSystemAdapter(base), configDir: ".obsidian", on: () => ({}) },
 		workspace: { onLayoutReady: () => {}, on: () => ({}), iterateAllLeaves: () => {} }, // layout never ready: no backup, no dialog, no ticks
-		keymap: { pushScope() {}, popScope() {} },
+		keymap: keymap(),
 		setting: { close() {} },
 	};
 	return { base, app };
+}
+/** Obsidian's keymap as far as scopes go: the top one gets the keys first; an empty one stops
+ *  Obsidian's hotkeys (Ctrl+N, Ctrl+W, ...); pop takes a scope out wherever it is. */
+function keymap() {
+	return {
+		scopes: [],
+		pushScope(s) { if (this.scopes[this.scopes.length - 1] !== s) this.scopes.push(s); },
+		popScope(s) { const i = this.scopes.indexOf(s); if (i >= 0) this.scopes.splice(i, 1); },
+	};
 }
 const coreState = (base) => JSON.parse(fs.readFileSync(path.join(base, PLUGIN_DIR, "core.json"), "utf8"));
 
@@ -478,6 +487,7 @@ async function main() {
 		check(byCls("vlb-overlay").some((e) => e.isConnected), "no lock screen");
 		const covers = byId("vlb-cover");
 		check(covers.length === 1 && covers[0].removed, "the cover was not made and then removed");
+		check(app.keymap.scopes.length === 1, "keymap scopes after start: " + app.keymap.scopes.length + " (want the lock screen's only)");
 		check(document.title === "Obsidian", "window title not hidden");
 		check(cur.lockScreen && cur.backup && cur.backup.control && cur.privateFolder, "test handles missing");
 		check(cur.host.settings === p.settings, "the app does not share the core's settings object");
@@ -489,6 +499,8 @@ async function main() {
 		check(byCls("vlb-overlay").every((e) => !e.isConnected), "the lock screen stayed after unload");
 		const left = globalThis.__vaultLock?.cover;
 		check(left && left.el.isConnected, "unload left no cover over the locked vault");
+		// Obsidian's hotkeys run before the cover's key swallow: the cover holds an empty scope.
+		check(app.keymap.scopes.length === 1, "the left cover does not stop Obsidian's hotkeys (keymap scopes: " + app.keymap.scopes.length + ")");
 		noLeaks();
 		await within(globalThis.__vaultLock.stopping ?? Promise.resolve(), 5_000, "stopping");
 
@@ -504,6 +516,7 @@ async function main() {
 		await macrotask();
 		check(p2.supervisor.current === null && p2.commands.length === 0, "the reload started before the previous copy had stopped");
 		check(left.el.isConnected, "the cover came down while waiting for the previous copy");
+		check(app.keymap.scopes.length === 1, "Obsidian's hotkeys work under the taken-over cover (keymap scopes: " + app.keymap.scopes.length + ")");
 		await obsidianSetsTitle("Third - My vault - Obsidian");
 		check(document.title === "Obsidian", "the cover let a note title through");
 		prev.release();
@@ -511,11 +524,27 @@ async function main() {
 		check(byId("vlb-cover").length === before, "the reload made a second cover instead of taking the old one");
 		check(!left.el.isConnected && !globalThis.__vaultLock.cover, "the taken-over cover was not removed");
 		check(p2.supervisor.current.locked() === true, "not locked after reload");
+		check(app.keymap.scopes.length === 1, "keymap scopes after the reload: " + app.keymap.scopes.length + " (the taken-over cover's scope was kept?)");
 		await macrotask();
 		noLeaks();
-		const left2 = await stopPlugin(p2);
-		check(left2, "no cover left after the second unload");
+
+		// 3c. A real disable: the left cover goes by itself after 5 s and gives Obsidian its hotkeys back.
+		step = "3c disable: the left cover goes";
+		const timers = [];
+		const realSetTimeout = globalThis.setTimeout;
+		globalThis.setTimeout = (fn, ms, ...a) => { const id = realSetTimeout(fn, ms, ...a); timers.push({ fn, id }); return id; };
+		let left2;
+		try { p2.unload(); left2 = globalThis.__vaultLock?.cover; } finally { globalThis.setTimeout = realSetTimeout; }
+		check(left2 && left2.el.isConnected, "no cover left after the second unload");
+		check(app.keymap.scopes.length === 1, "the left cover does not stop Obsidian's hotkeys (keymap scopes: " + app.keymap.scopes.length + ")");
 		noLeaks();
+		await within(globalThis.__vaultLock.stopping ?? Promise.resolve(), 5_000, "stopping");
+		const t = timers.find((x) => x.id === left2.timer);
+		check(t, "the left cover has no timer");
+		clearTimeout(t.id);
+		t.fn(); // the 5 s are up (this shows the vault: a disable unlocks, by design)
+		check(!left2.el.isConnected && !globalThis.__vaultLock.cover, "the left cover did not go");
+		check(app.keymap.scopes.length === 0, "the left cover went but left Obsidian's hotkeys off (keymap scopes: " + app.keymap.scopes.length + ")");
 	}
 
 	// 4. Safe mode remembered in core.json: the lifeboat runs, locked, with no network.
@@ -666,6 +695,7 @@ async function main() {
 		// The built-in started fine and was replaced within its first 90 s: not a crash at the next start.
 		check(coreState(base).starting === null, "a switch away left core.json starting set: " + JSON.stringify(coreState(base).starting));
 		check(byId("vlb-cover").length === coversBefore + 1 && byId("vlb-cover").every((e) => e.removed), "the switch did not cover the window");
+		check(p.app.keymap.scopes.length === 1, "keymap scopes after the switch: " + p.app.keymap.scopes.length + " (want the lifeboat's only)");
 		noLeaks();
 		server.files.set("_control/config.json", Buffer.from(JSON.stringify({ core: { safeMode: false } })));
 		await within(S.tick(), 5_000, "tick");
