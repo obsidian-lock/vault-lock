@@ -1,5 +1,6 @@
 import { FileSystemAdapter, Notice, Platform, TFile, WorkspaceLeaf } from "obsidian";
-import type VLBPlugin from "./main";
+import type { App } from "obsidian";
+import type { VLBSettings } from "./settings";
 
 /**
  * The private folder lives at `Private/` while unlocked and `.Private/` while locked.
@@ -11,10 +12,10 @@ export class PrivateFolder {
 	/** hide() and show() run one at a time, so a quick unlock cannot overtake a lock. */
 	private chain: Promise<void> = Promise.resolve();
 
-	constructor(private plugin: VLBPlugin) {}
+	constructor(private app: App, private settings: () => VLBSettings) {}
 
 	get name(): string {
-		return this.plugin.settings.privateFolder.trim().replace(/^\/+|\/+$/g, "");
+		return this.settings().privateFolder.trim().replace(/^\/+|\/+$/g, "");
 	}
 	get hiddenName(): string {
 		return this.name ? "." + this.name : "";
@@ -68,7 +69,7 @@ export class PrivateFolder {
 	}
 
 	private async rename(from: string, to: string, hidden: boolean): Promise<void> {
-		const adapter = this.plugin.app.vault.adapter;
+		const adapter = this.app.vault.adapter;
 		const [fromExists, toExists] = await Promise.all([adapter.exists(from), adapter.exists(to)]);
 		if (!fromExists) return;
 		if (toExists) {
@@ -87,7 +88,7 @@ export class PrivateFolder {
 	 */
 	private async closeLeavesUnder(prefix: string): Promise<void> {
 		const leaves: WorkspaceLeaf[] = [];
-		this.plugin.app.workspace.iterateAllLeaves((leaf) => {
+		this.app.workspace.iterateAllLeaves((leaf) => {
 			const f = (leaf.view as unknown as { file?: TFile }).file;
 			if (f && (f.path === prefix || f.path.startsWith(prefix + "/"))) leaves.push(leaf);
 		});
@@ -109,7 +110,7 @@ export class PrivateFolder {
 	 */
 	private async setWindowsHidden(rel: string, hidden: boolean): Promise<void> {
 		if (!Platform.isWin) return;
-		const adapter = this.plugin.app.vault.adapter;
+		const adapter = this.app.vault.adapter;
 		if (!(adapter instanceof FileSystemAdapter)) return;
 		try {
 			if (!(await adapter.exists(rel))) return;

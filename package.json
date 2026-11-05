@@ -1,6 +1,6 @@
 {
   "name": "vault-lock",
-  "version": "1.6.2",
+  "version": "1.7.0-dev",
   "description": "Obsidian plugin: passphrase lock screen, a private folder hidden while locked, and a one-way WebDAV backup.",
   "keywords": [
     "obsidian",
@@ -18,7 +18,8 @@
   "private": true,
   "scripts": {
     "build": "node esbuild.config.mjs",
-    "check": "tsc --noEmit -p tsconfig.json"
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node scripts/smoke.mjs && bash scripts/test-roundtrip.sh"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

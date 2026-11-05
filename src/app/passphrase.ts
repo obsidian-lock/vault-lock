@@ -1,6 +1,6 @@
-import { App, Modal, Notice, Setting } from "obsidian";
-import type VLBPlugin from "./main";
-import { hashPass, randomHex, safeEqual } from "./crypto";
+import { Modal, Notice, Setting } from "obsidian";
+import type { VaultLockApp } from "./app";
+import { hashPass, randomHex, safeEqual } from "../shared/crypto";
 
 const MIN_LENGTH = 4;
 
@@ -11,12 +11,12 @@ const MIN_LENGTH = 4;
 export class PassphraseModal extends Modal {
 	private busy = false;
 
-	constructor(app: App, private plugin: VLBPlugin, private onSaved?: () => void) {
-		super(app);
+	constructor(private owner: VaultLockApp, private onSaved?: () => void) {
+		super(owner.app);
 	}
 
 	onOpen(): void {
-		const s = this.plugin.settings;
+		const s = this.owner.settings;
 		const changing = !!s.passHash;
 		const { contentEl } = this;
 		this.titleEl.setText(changing ? "Change passphrase" : "Choose a passphrase");
@@ -55,8 +55,8 @@ export class PassphraseModal extends Modal {
 				const salt = randomHex(16);
 				s.passHash = await hashPass(next, salt);
 				s.passSalt = salt;
-				await this.plugin.saveSettings();
-				this.plugin.backup.control.offerPassphrase(next);
+				await this.owner.saveSettings();
+				this.owner.backup.control.offerPassphrase(next);
 			} finally {
 				this.busy = false;
 			}

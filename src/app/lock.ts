@@ -1,6 +1,6 @@
 import { Notice, Scope } from "obsidian";
-import type VLBPlugin from "./main";
-import { hashPass, safeEqual } from "./crypto";
+import type { VaultLockApp } from "./app";
+import { hashPass, safeEqual } from "../shared/crypto";
 
 const IDLE_CHECK_MS = 15_000;
 const LOCKED_TITLE = "Obsidian";
@@ -16,18 +16,18 @@ export class LockScreen {
 	private titleGuards = new Map<Document, { saved: string; observer: MutationObserver }>();
 	private watched = new WeakSet<Window>();
 
-	constructor(private plugin: VLBPlugin) {}
+	constructor(private owner: VaultLockApp) {}
 
 	get hasPass(): boolean {
-		return !!this.plugin.settings.passHash && !!this.plugin.settings.passSalt;
+		return !!this.owner.settings.passHash && !!this.owner.settings.passSalt;
 	}
 
 	install(): void {
 		this.watchWindow(window);
-		this.plugin.app.workspace.iterateAllLeaves((leaf) => this.watchWindow(leaf.view.containerEl.win));
-		this.plugin.registerInterval(window.setInterval(() => this.checkIdle(), IDLE_CHECK_MS));
+		this.owner.app.workspace.iterateAllLeaves((leaf) => this.watchWindow(leaf.view.containerEl.win));
+		this.owner.registerInterval(window.setInterval(() => this.checkIdle(), IDLE_CHECK_MS));
 		// Pop-out windows: their activity counts, and ones opened while locked get their title hidden too.
-		this.plugin.registerEvent(this.plugin.app.workspace.on("window-open", (_ww, win) => {
+		this.owner.registerEvent(this.owner.app.workspace.on("window-open", (_ww, win) => {
 			this.watchWindow(win);
 			if (this.locked) this.guardTitle(win.document);
 		}));
@@ -39,15 +39,15 @@ export class LockScreen {
 		this.watched.add(win);
 		const touch = () => { this.lastActivity = Date.now(); };
 		for (const ev of ["mousemove", "mousedown", "keydown", "wheel", "touchstart"] as const) {
-			this.plugin.registerDomEvent(win.document, ev, touch, { passive: true, capture: true });
+			this.owner.registerDomEvent(win.document, ev, touch, { passive: true, capture: true });
 		}
-		this.plugin.registerDomEvent(win, "blur", () => {
-			if (!this.plugin.settings.lockOnBlur) return;
+		this.owner.registerDomEvent(win, "blur", () => {
+			if (!this.owner.settings.lockOnBlur) return;
 			// Moving between Obsidian's own windows is not leaving Obsidian: look again in a moment.
 			win.setTimeout(() => { if (!this.anyWindowFocused()) void this.lock(); }, 150);
 		});
 		// Belt and braces: while locked, swallow every key that isn't typed into the unlock box.
-		this.plugin.registerDomEvent(win, "keydown", (e: KeyboardEvent) => {
+		this.owner.registerDomEvent(win, "keydown", (e: KeyboardEvent) => {
 			if (!this.locked) return;
 			if (this.overlay && this.overlay.contains(e.target as Node)) return;
 			e.stopImmediatePropagation();
@@ -57,24 +57,26 @@ export class LockScreen {
 
 	private anyWindowFocused(): boolean {
 		let focused = document.hasFocus();
-		this.plugin.app.workspace.iterateAllLeaves((leaf) => { if (leaf.view.containerEl.doc.hasFocus()) focused = true; });
+		this.owner.app.workspace.iterateAllLeaves((leaf) => { if (leaf.view.containerEl.doc.hasFocus()) focused = true; });
 		return focused;
 	}
 
 	private checkIdle(): void {
-		const m = this.plugin.settings.idleMinutes;
+		const m = this.owner.settings.idleMinutes;
 		if (!this.hasPass || this.locked || m <= 0) return;
 		if (Date.now() - this.lastActivity >= m * 60_000) void this.lock();
 	}
 
 	async lock(): Promise<void> {
+		// A stopped app never locks again (a blur timer can fire after stop): its lock screen would never go away.
+		if (this.owner.stopping) return;
 		if (!this.hasPass) { new Notice("Vault Lock: set a passphrase in settings first."); return; }
 		if (this.locked || this.busy) return;
 		this.busy = true;
 		try {
 			this.locked = true;
 			this.showOverlay();
-			await this.plugin.privateFolder.hide();
+			await this.owner.privateFolder.hide();
 		} catch (e) {
 			console.error("[VLB] lock failed", e);
 		} finally {
@@ -83,7 +85,7 @@ export class LockScreen {
 	}
 
 	private async tryUnlock(pass: string): Promise<boolean> {
-		const s = this.plugin.settings;
+		const s = this.owner.settings;
 		const h = await hashPass(pass, s.passSalt);
 		if (!safeEqual(h, s.passHash)) {
 			this.failedAttempts++;
@@ -93,21 +95,21 @@ export class LockScreen {
 		this.failedAttempts = 0;
 		this.locked = false;
 		this.lastActivity = Date.now();
-		this.plugin.backup.control.offerPassphrase(pass);
+		this.owner.backup.control.offerPassphrase(pass);
 		this.removeOverlay();
-		try { await this.plugin.privateFolder.show(); } catch (e) { console.error("[VLB] unhide failed", e); }
+		try { await this.owner.privateFolder.show(); } catch (e) { console.error("[VLB] unhide failed", e); }
 		return true;
 	}
 
 	private showOverlay(): void {
 		if (this.overlay) return;
 		this.scope = new Scope();
-		this.plugin.app.keymap.pushScope(this.scope);
+		this.owner.app.keymap.pushScope(this.scope);
 		this.guardTitle(document);
-		this.plugin.app.workspace.iterateAllLeaves((leaf) => this.guardTitle(leaf.view.containerEl.doc));
+		this.owner.app.workspace.iterateAllLeaves((leaf) => this.guardTitle(leaf.view.containerEl.doc));
 		// Settings opens in its own window, which the overlay does not cover. Leaving it open
 		// would let someone switch the plugin off and so unlock the vault.
-		(this.plugin.app as unknown as { setting?: { close?: () => void } }).setting?.close?.();
+		(this.owner.app as unknown as { setting?: { close?: () => void } }).setting?.close?.();
 		document.body.addClass("vlb-locked");
 
 		const o = document.body.createDiv({ cls: "vlb-overlay" });
@@ -163,7 +165,7 @@ export class LockScreen {
 	}
 
 	private removeOverlay(): void {
-		if (this.scope) { this.plugin.app.keymap.popScope(this.scope); this.scope = null; }
+		if (this.scope) { this.owner.app.keymap.popScope(this.scope); this.scope = null; }
 		document.body.removeClass("vlb-locked");
 		for (const [doc, g] of this.titleGuards) {
 			g.observer.disconnect();

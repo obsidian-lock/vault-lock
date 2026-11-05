@@ -1,4 +1,4 @@
-# Checks the attrib.exe calls the plugin makes on lock and unlock (src/privateFolder.ts):
+# Checks the attrib.exe calls the plugin makes on lock and unlock (src/shared/privateFolder.ts):
 # the private folder and everything in it get the hidden attribute, then lose it again.
 $ErrorActionPreference = 'Stop'
 $root = Join-Path $env:TEMP ('vlb-hide-' + [guid]::NewGuid())

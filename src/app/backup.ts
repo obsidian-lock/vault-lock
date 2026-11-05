@@ -1,9 +1,10 @@
 import { requestUrl, RequestUrlResponse, TAbstractFile, TFolder } from "obsidian";
-import type VLBPlugin from "./main";
-import { b64 } from "./crypto";
-import { Control, CONTROL } from "./control";
+import type { VaultLockApp } from "./app";
+import { Control } from "./control";
 import { Pairing } from "./pairing";
-import { PAIR_DIR, SERVER_URL } from "./server";
+import { MAX_BYTES } from "../shared/constants";
+import { authFor, basicAuth, dav, davUrl, DavError, errMsg, withTimeout } from "../shared/dav";
+import { excluded as isExcluded, Index, LocalFile, MANIFEST, parentOf, scan, stamp, TRASH } from "../shared/vaultfiles";
 
 /**
  * One-way push of the vault to a WebDAV folder.
@@ -24,27 +25,14 @@ import { PAIR_DIR, SERVER_URL } from "./server";
  * `vlb status`. The developer console gets a `[VLB backup]` line for everything.
  */
 
-export type Entry = { m: number; s: number };
-type Manifest = Record<string, Entry>;
-
-const MANIFEST = "_manifest.json";
-const TRASH = "_trash";
-const MAX_BYTES = 100 * 1024 * 1024;
 const DEBOUNCE_MS = 2_000;
 const MANIFEST_FLUSH_MS = 5_000;
 const RETRY_MS = 60_000;
 const STARTUP_DELAY_MS = 8_000;
-const REQUEST_TIMEOUT_MS = 60_000; // plus 1 ms per 100 bytes of body, so a big PUT gets its time
 const FLUSH_EVERY_MS = 30_000; // during a long reconcile, save the index this often
-const STOP_WAIT_MS = 30_000; // how long a stopping copy of the plugin may take to finish its run
-
-declare global {
-	// Set by stop(): a new copy of the plugin (after a BRAT update) waits for the old one's run to end.
-	interface Window { __vaultLockStopping?: Promise<void> }
-}
 
 export class Backup {
-	manifest: Manifest = {};
+	manifest: Index = {};
 	control: Control;
 	pairing: Pairing;
 	lastError = "";
@@ -63,9 +51,9 @@ export class Backup {
 	private paired = false;
 	private trashSeq = 0;
 
-	constructor(private plugin: VLBPlugin) {
-		this.control = new Control(plugin, this);
-		this.pairing = new Pairing(plugin, this);
+	constructor(private owner: VaultLockApp) {
+		this.control = new Control(owner, this);
+		this.pairing = new Pairing(owner, this);
 	}
 
 	/** Runs once this computer has a working login on the server. */
@@ -76,28 +64,23 @@ export class Backup {
 	// ---- lifecycle -----------------------------------------------------------
 
 	start(): void {
-		const v = this.plugin.app.vault;
-		this.plugin.registerEvent(v.on("create", (f) => this.onChange(f.path)));
-		this.plugin.registerEvent(v.on("modify", (f) => this.onChange(f.path)));
-		this.plugin.registerEvent(v.on("delete", (f) => this.onDelete(f)));
-		this.plugin.registerEvent(v.on("rename", (f, old) => this.onRename(f, old)));
-		this.plugin.registerDomEvent(window, "online", () => this.requestReconcile("online"));
+		const v = this.owner.app.vault;
+		this.owner.registerEvent(v.on("create", (f) => this.onChange(f.path)));
+		this.owner.registerEvent(v.on("modify", (f) => this.onChange(f.path)));
+		this.owner.registerEvent(v.on("delete", (f) => this.onDelete(f)));
+		this.owner.registerEvent(v.on("rename", (f, old) => this.onRename(f, old)));
+		this.owner.registerDomEvent(window, "online", () => this.requestReconcile("online"));
 		this.scheduleInterval();
 		void this.begin();
 	}
 
+	// After a reload (a BRAT update) the core has already waited for the old copy's run to end.
 	private async begin(): Promise<void> {
-		// After a reload (a BRAT update) the old copy may still be finishing a run: let it end first.
-		const prev = window.__vaultLockStopping;
-		if (prev) {
-			await prev; // never rejects, and gives up after 30 s
-			if (window.__vaultLockStopping === prev) delete window.__vaultLockStopping;
-		}
 		if (this.stopped) return;
 		try {
 			await this.pairing.ensureIdentity();
 			if (this.stopped) return;
-			if (Pairing.isDeviceLogin(this.plugin.settings.webdavUser)) {
+			if (Pairing.isDeviceLogin(this.owner.settings.webdavUser)) {
 				// Also covers an already-paired computer: the first check succeeds and starts the backup.
 				this.pairing.start();
 			} else {
@@ -123,19 +106,21 @@ export class Backup {
 
 	/** Status of a login check, without throwing on HTTP errors. */
 	async probe(): Promise<number> {
-		const s = this.plugin.settings;
+		this.checkAborted();
+		const auth = authFor(this.owner.settings);
 		const r = await withTimeout(requestUrl({
-			url: this.base,
+			url: auth.base,
 			method: "PROPFIND",
-			headers: { Authorization: "Basic " + b64(s.webdavUser + ":" + s.webdavPass), Depth: "0" },
+			headers: { Authorization: basicAuth(auth), Depth: "0" },
 			throw: false,
 		}), 30_000, "PROPFIND");
 		return r.status;
 	}
 
-	/** Stops at once; the promise resolves when the run in progress has ended (it stops between
-	 *  files), or after 30 s. Kept in window.__vaultLockStopping for the next copy of the plugin. */
-	stop(): Promise<void> {
+	/** Stops at once; resolves when the run in progress has ended (it stops between files) and
+	 *  the index is saved. The core bounds the wait, and once it gives up on this copy every
+	 *  request fails, so the next copy of the plugin is the only one writing. */
+	async stop(): Promise<void> {
 		this.stopped = true;
 		this.pairing.stop();
 		for (const t of this.pending.values()) window.clearTimeout(t);
@@ -143,13 +128,13 @@ export class Backup {
 		for (const t of [this.manifestTimer, this.retryTimer, this.intervalTimer, this.startupTimer]) {
 			if (t) window.clearTimeout(t);
 		}
-		const mine = withTimeout(this.queue.catch(() => {}), STOP_WAIT_MS, "last backup run")
-			.catch(() => console.warn("[VLB backup] the last run had not ended 30 s after stopping"));
-		// Two reloads in a row: the next copy must also wait for a run of the copy before this one.
-		const prev = window.__vaultLockStopping;
-		const done = prev ? Promise.all([prev, mine]).then(() => {}) : mine;
-		window.__vaultLockStopping = done;
-		return done;
+		await this.queue.catch(() => {});
+		// A file uploaded in the last seconds whose index save was still waiting on its timer.
+		try {
+			await this.flushManifest();
+		} catch (e) {
+			console.log("[VLB backup] could not save the index while stopping:", errMsg(e));
+		}
 	}
 
 	/** Forget the server index; the next reconcile re-uploads every file. */
@@ -162,10 +147,10 @@ export class Backup {
 
 	/** Local path for a server path: inside the private folder, that is the hidden name while locked. */
 	async toLocal(sp: string): Promise<string> {
-		const pf = this.plugin.privateFolder;
+		const pf = this.owner.privateFolder;
 		if (!pf.enabled) return sp;
 		if (sp === pf.name || sp.startsWith(pf.name + "/")) {
-			if (await this.plugin.app.vault.adapter.exists(pf.hiddenName)) return pf.hiddenName + sp.slice(pf.name.length);
+			if (await this.owner.app.vault.adapter.exists(pf.hiddenName)) return pf.hiddenName + sp.slice(pf.name.length);
 		}
 		return sp;
 	}
@@ -173,7 +158,7 @@ export class Backup {
 	scheduleInterval(): void {
 		if (this.stopped) return; // a stopped copy (after a reload) must not re-arm its timer
 		if (this.intervalTimer) window.clearTimeout(this.intervalTimer);
-		const min = Math.max(1, this.plugin.settings.reconcileMinutes || 10);
+		const min = Math.max(1, this.owner.settings.reconcileMinutes || 10);
 		this.intervalTimer = window.setTimeout(() => {
 			this.requestReconcile("interval");
 			this.scheduleInterval();
@@ -197,9 +182,9 @@ export class Backup {
 		const isFolder = f instanceof TFolder;
 		const path = f.path;
 		this.run(async () => {
-			const adapter = this.plugin.app.vault.adapter;
+			const adapter = this.owner.app.vault.adapter;
 			// Lock/unlock renames Private <-> .Private; Obsidian reports that as a delete.
-			const alt = this.plugin.privateFolder.altPath(path);
+			const alt = this.owner.privateFolder.altPath(path);
 			if (alt && (await adapter.exists(alt))) return;
 			if (await adapter.exists(path)) return;
 			await this.trash(this.serverPath(path), isFolder);
@@ -269,7 +254,7 @@ export class Backup {
 	private async onFailure(e: unknown): Promise<void> {
 		console.error("[VLB backup]", e, "— retrying in a minute");
 		if (this.stopped) return; // a newer copy of the plugin takes over
-		if (e instanceof DavError && e.status === 401 && Pairing.isDeviceLogin(this.plugin.settings.webdavUser)) {
+		if (e instanceof DavError && e.status === 401 && Pairing.isDeviceLogin(this.owner.settings.webdavUser)) {
 			// The server no longer knows this computer (its login was removed): pair again.
 			this.paired = false;
 			this.failed = false;
@@ -322,8 +307,8 @@ export class Backup {
 			console.warn("[VLB backup] config or commands not applied; backing up anyway:", e);
 		}
 
-		const local = new Map<string, { path: string; m: number; s: number }>();
-		await this.scan("", local);
+		const local = new Map<string, LocalFile>();
+		await scan(this.owner.app.vault.adapter, "", local, (p) => this.excluded(p), (p) => this.serverPath(p));
 
 		let uploaded = 0;
 		const skipped: string[] = [];
@@ -368,32 +353,9 @@ export class Backup {
 			(failed.length ? `, ${failed.length} failed` : ""));
 	}
 
-	private async scan(dir: string, out: Map<string, { path: string; m: number; s: number }>): Promise<void> {
-		const adapter = this.plugin.app.vault.adapter;
-		let listed;
-		try {
-			listed = await adapter.list(dir);
-		} catch (e) {
-			if (dir === "") listed = await adapter.list("/");
-			else throw e;
-		}
-		for (const f of listed.files) {
-			const p = clean(f);
-			if (this.excluded(p)) continue;
-			const st = await adapter.stat(p);
-			if (!st || st.type !== "file") continue;
-			out.set(this.serverPath(p), { path: p, m: st.mtime, s: st.size });
-		}
-		for (const d of listed.folders) {
-			const p = clean(d);
-			if (this.excluded(p + "/")) continue;
-			await this.scan(p, out);
-		}
-	}
-
 	private async syncPath(path: string): Promise<void> {
 		if (this.excluded(path)) return;
-		const st = await this.plugin.app.vault.adapter.stat(path);
+		const st = await this.owner.app.vault.adapter.stat(path);
 		if (!st || st.type !== "file") return;
 		await this.loadManifest();
 		const sp = this.serverPath(path);
@@ -410,7 +372,7 @@ export class Backup {
 		}
 		let data: ArrayBuffer;
 		try {
-			data = await this.plugin.app.vault.adapter.readBinary(path);
+			data = await this.owner.app.vault.adapter.readBinary(path);
 		} catch (e) {
 			throw new FileError(`cannot be read: ${errMsg(e)}`);
 		}
@@ -464,10 +426,10 @@ export class Backup {
 		this.manifestDirty = false;
 	}
 
-	private parseManifest(r: RequestUrlResponse): Manifest {
+	private parseManifest(r: RequestUrlResponse): Index {
 		try {
 			const j = JSON.parse(r.text);
-			return j && typeof j === "object" && !Array.isArray(j) ? (j as Manifest) : {};
+			return j && typeof j === "object" && !Array.isArray(j) ? (j as Index) : {};
 		} catch {
 			return {};
 		}
@@ -495,14 +457,8 @@ export class Backup {
 
 	// ---- WebDAV --------------------------------------------------------------
 
-	private get base(): string {
-		let u = this.plugin.settings.webdavUrl.trim() || SERVER_URL;
-		if (!u.endsWith("/")) u += "/";
-		return u;
-	}
-
 	private url(sp: string): string {
-		return this.base + sp.split("/").map(encodeURIComponent).join("/");
+		return davUrl(authFor(this.owner.settings), sp);
 	}
 
 	async ensureDir(dir: string): Promise<void> {
@@ -523,63 +479,28 @@ export class Backup {
 	}
 
 	async dav(method: string, sp: string, body?: ArrayBuffer | string, headers: Record<string, string> = {}, alsoOk: number[] = []): Promise<RequestUrlResponse> {
-		const s = this.plugin.settings;
-		const h: Record<string, string> = { Authorization: "Basic " + b64(s.webdavUser + ":" + s.webdavPass), ...headers };
-		const bytes = typeof body === "string" ? body.length : body ? body.byteLength : 0;
-		const r = await withTimeout(requestUrl({ url: this.url(sp), method, headers: h, body, throw: false }), REQUEST_TIMEOUT_MS + bytes / 100, `${method} ${sp}`);
-		const ok =
-			r.status < 300 ||
-			alsoOk.includes(r.status) ||
-			(method === "MKCOL" && r.status === 405) ||
-			(method === "MOVE" && r.status === 404) ||
-			(method === "GET" && r.status === 404);
-		if (!ok) throw new DavError(`${method} ${sp}: HTTP ${r.status}`, r.status);
-		return r;
+		this.checkAborted();
+		return dav(authFor(this.owner.settings), method, sp, body, headers, alsoOk);
+	}
+
+	/** The core gave up on this copy of the app (it stopped too slowly): no more requests. */
+	checkAborted(): void {
+		if (this.owner.host.isAborted()) throw new DavError("stopped", 0);
 	}
 
 	// ---- helpers -------------------------------------------------------------
 
 	private serverPath(path: string): string {
-		return this.plugin.privateFolder.toVisible(path);
+		return this.owner.privateFolder.toVisible(path);
 	}
 
 	private excluded(path: string): boolean {
 		// The plugin's own folder holds data.json and its copy (passphrase hash, this computer's server key): never uploaded.
-		const own = this.plugin.manifest.dir ?? ".obsidian/plugins/vault-lock";
-		if (path === own || path.startsWith(own + "/") || path === MANIFEST) return true;
-		for (const reserved of [TRASH, CONTROL, PAIR_DIR]) {
-			if (path === reserved || path.startsWith(reserved + "/")) return true;
-		}
-		for (const line of this.plugin.settings.excludes.split("\n")) {
-			const p = line.trim();
-			if (p && path.startsWith(p)) return true;
-		}
-		return false;
+		return isExcluded(path, this.owner.manifest.dir ?? ".obsidian/plugins/vault-lock", this.owner.settings.excludes);
 	}
 
 	stamp(): string {
 		return stamp();
-	}
-}
-
-function clean(p: string): string {
-	return p.replace(/^\/+/, "");
-}
-
-function parentOf(p: string): string {
-	const i = p.lastIndexOf("/");
-	return i < 0 ? "" : p.slice(0, i);
-}
-
-function stamp(): string {
-	const d = new Date();
-	const z = (n: number) => String(n).padStart(2, "0");
-	return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}_${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`;
-}
-
-export class DavError extends Error {
-	constructor(message: string, readonly status: number) {
-		super(message);
 	}
 }
 
@@ -590,18 +511,4 @@ class FileError extends Error {}
 function isPerFile(e: unknown): boolean {
 	if (e instanceof FileError) return true;
 	return e instanceof DavError && e.status >= 400 && e.status < 500 && e.status !== 401 && e.status !== 403;
-}
-
-/** Fail instead of waiting forever on a connection that stays open but never answers. */
-export function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
-	let timer = 0;
-	const limit = new Promise<never>((_, reject) => {
-		timer = window.setTimeout(() => reject(new DavError(`${what}: no answer from the server in ${Math.round(ms / 1000)} s`, 0)), ms);
-	});
-	return Promise.race([p, limit]).finally(() => window.clearTimeout(timer));
-}
-
-function errMsg(e: unknown): string {
-	if (e instanceof Error) return e.message;
-	return String(e);
 }

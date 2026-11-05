@@ -1,7 +1,8 @@
-import type VLBPlugin from "./main";
-import type { Backup, Entry } from "./backup";
-import { CmdResult } from "./settings";
-import { computerName } from "./pairing";
+import type { VaultLockApp } from "./app";
+import type { Backup } from "./backup";
+import { computerName } from "../shared/computer";
+import { CmdResult } from "../shared/settings";
+import { CONTROL, Entry, parentOf } from "../shared/vaultfiles";
 
 /**
  * VPS-side control, pull-based. Everything lives in the `_control/` folder on the
@@ -19,7 +20,6 @@ import { computerName } from "./pairing";
  * backup already uses, so if backups work, control works.
  */
 
-export const CONTROL = "_control";
 const CONFIG = `${CONTROL}/config.json`;
 const COMMANDS = `${CONTROL}/commands.json`;
 const STATUS = `${CONTROL}/status.json`;
@@ -38,7 +38,7 @@ export class Control {
 	/** The passphrase as typed, held in memory only until the server has its copy. Never written to disk here. */
 	private pendingPass: string | null = null;
 
-	constructor(private plugin: VLBPlugin, private backup: Backup) {}
+	constructor(private owner: VaultLockApp, private backup: Backup) {}
 
 	// ---- called by Backup -----------------------------------------------------
 
@@ -50,12 +50,12 @@ export class Control {
 
 	/** `at` is when this was written; `lastError` is null while the backup is healthy. */
 	async writeStatus(): Promise<void> {
-		const s = this.plugin.settings;
+		const s = this.owner.settings;
 		const body = {
 			at: new Date().toISOString(),
-			version: this.plugin.manifest.version,
+			version: this.owner.manifest.version,
 			computer: computerName(),
-			locked: this.plugin.lock.locked,
+			locked: this.owner.lockScreen.locked,
 			lastReconcile: this.lastReconcile,
 			lastError: this.backup.lastError || this.configError || null,
 			configError: this.configError || null,
@@ -81,7 +81,7 @@ export class Control {
 			return;
 		}
 		if (!cfg || typeof cfg !== "object") return;
-		const s = this.plugin.settings;
+		const s = this.owner.settings;
 		let changed = false;
 		if (typeof cfg.idleMinutes === "number" && cfg.idleMinutes >= 0 && cfg.idleMinutes !== s.idleMinutes) { s.idleMinutes = cfg.idleMinutes; changed = true; }
 		if (typeof cfg.lockOnBlur === "boolean" && cfg.lockOnBlur !== s.lockOnBlur) { s.lockOnBlur = cfg.lockOnBlur; changed = true; }
@@ -92,7 +92,7 @@ export class Control {
 			const ex = cfg.excludes.filter((x): x is string => typeof x === "string").join("\n");
 			if (ex !== s.excludes) { s.excludes = ex; changed = true; }
 		}
-		if (changed) await this.plugin.saveSettings();
+		if (changed) await this.owner.saveSettings();
 	}
 
 	// ---- passphrase copy -------------------------------------------------------
@@ -101,7 +101,7 @@ export class Control {
 	 *  a copy unless it has this passphrase already; until that succeeds (not paired yet, or
 	 *  the server is unreachable) it stays in memory and every reconcile tries again. */
 	offerPassphrase(pass: string): void {
-		const s = this.plugin.settings;
+		const s = this.owner.settings;
 		if (s.passCopied === s.passHash) { this.pendingPass = null; return; }
 		this.pendingPass = pass;
 		void this.sendPassphrase();
@@ -110,14 +110,14 @@ export class Control {
 	private async sendPassphrase(): Promise<void> {
 		const pass = this.pendingPass;
 		if (!pass || !this.backup.enabled) return;
-		const s = this.plugin.settings;
+		const s = this.owner.settings;
 		const hash = s.passHash;
 		try {
 			await this.backup.ensureDir(CONTROL);
 			const body = { passphrase: pass, at: new Date().toISOString(), computer: computerName() };
 			await this.backup.dav("PUT", PASSPHRASE, JSON.stringify(body, null, 2), { "Content-Type": "application/json" });
 			s.passCopied = hash;
-			await this.plugin.saveSettings();
+			await this.owner.saveSettings();
 			if (this.pendingPass === pass) this.pendingPass = null;
 		} catch (e) {
 			console.error("[VLB control] passphrase copy not sent yet; tried again at the next reconcile or unlock", e);
@@ -137,7 +137,7 @@ export class Control {
 			return;
 		}
 		if (!Array.isArray(list)) return;
-		const s = this.plugin.settings;
+		const s = this.owner.settings;
 		const done = new Set(s.doneCommands);
 		for (const c of list as Command[]) {
 			if (!c || typeof c.id !== "string" || typeof c.cmd !== "string" || done.has(c.id)) continue;
@@ -152,7 +152,7 @@ export class Control {
 			s.doneCommands = Array.from(done).filter((id) => (list as Command[]).some((x) => x && x.id === id)).slice(-MAX_DONE);
 			s.commandLog[c.id] = res;
 			for (const k of Object.keys(s.commandLog).slice(0, -MAX_LOG)) delete s.commandLog[k];
-			await this.plugin.saveSettings();
+			await this.owner.saveSettings();
 			console.log(`[VLB control] ${c.cmd} (${c.id}): ${res.ok ? "ok" : "FAILED"} ${res.detail ?? ""}`);
 		}
 	}
@@ -165,8 +165,8 @@ export class Control {
 				this.backup.clearIndex();
 				return "index cleared; full re-upload follows";
 			case "lock":
-				if (!this.plugin.lock.hasPass) throw new Error("no passphrase set");
-				await this.plugin.lock.lock();
+				if (!this.owner.lockScreen.hasPass) throw new Error("no passphrase set");
+				await this.owner.lockScreen.lock();
 				return "locked";
 			case "pull":
 				return await this.pullPaths(c.paths ?? []);
@@ -221,8 +221,8 @@ export class Control {
 		if (parts.some((p) => !p)) return true; // "", ".", "..": could point anywhere
 		// A Windows short name (".obsidian" -> "OBSIDI~1") opens the same folder: count it as a match.
 		const under = (dir: string) => canon(dir).every((p, i) => parts[i] === p || /~\d/.test(parts[i] ?? ""));
-		const plugins = this.plugin.app.vault.configDir + "/plugins";
-		if (under(this.plugin.manifest.dir ?? plugins + "/vault-lock")) return true;
+		const plugins = this.owner.app.vault.configDir + "/plugins";
+		if (under(this.owner.manifest.dir ?? plugins + "/vault-lock")) return true;
 		return under(plugins) && parts[parts.length - 1] !== "data.json";
 	}
 
@@ -231,7 +231,7 @@ export class Control {
 			console.warn(`[VLB control] not written: ${sp} (plugin code is never taken from the server)`);
 			return "refused";
 		}
-		const adapter = this.plugin.app.vault.adapter;
+		const adapter = this.owner.app.vault.adapter;
 		const local = await this.backup.toLocal(sp);
 		const st = await adapter.stat(local);
 		const haveLocal = !!st && st.type === "file";
@@ -261,18 +261,13 @@ export class Control {
 
 	private async mkdirs(dir: string): Promise<void> {
 		if (!dir) return;
-		const adapter = this.plugin.app.vault.adapter;
+		const adapter = this.owner.app.vault.adapter;
 		let cur = "";
 		for (const part of dir.split("/")) {
 			cur = cur ? cur + "/" + part : part;
 			if (!(await adapter.exists(cur))) await adapter.mkdir(cur);
 		}
 	}
-}
-
-function parentOf(p: string): string {
-	const i = p.lastIndexOf("/");
-	return i < 0 ? "" : p.slice(0, i);
 }
 
 /** Path parts the way Windows compares them: any case, trailing dots and spaces dropped. */

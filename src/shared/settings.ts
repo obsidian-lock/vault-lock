@@ -8,7 +8,7 @@ export interface VLBSettings {
 	idleMinutes: number;
 	lockOnBlur: boolean;
 	privateFolder: string;
-	/** Empty means the built-in server (src/server.ts). Pairing fills in user and pass. */
+	/** Empty means the built-in server (src/shared/server.ts). Pairing fills in user and pass. */
 	webdavUrl: string;
 	webdavUser: string;
 	webdavPass: string;

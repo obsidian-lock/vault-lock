@@ -8,3 +8,8 @@ export const SERVER_URL = "https://vault.815431624.xyz/";
 export const PAIR_LOGIN = { user: "pair", pass: "vault-lock-backup-pairing" };
 /** Where pairing requests go, relative to SERVER_URL. Never used for vault files. */
 export const PAIR_DIR = "_pair";
+/**
+ * Public keys (Ed25519, SPKI DER as hex) that may sign app bundles sent by the server.
+ * A list, so a key can be replaced by shipping a release with both.
+ */
+export const UPDATE_PUBKEYS: string[] = [];

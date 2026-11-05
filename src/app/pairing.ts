@@ -1,11 +1,12 @@
 import { requestUrl } from "obsidian";
-import { withTimeout } from "./backup";
 import bcrypt from "bcryptjs";
 import * as os from "os";
-import type VLBPlugin from "./main";
+import type { VaultLockApp } from "./app";
 import type { Backup } from "./backup";
-import { b64, randomHex } from "./crypto";
-import { PAIR_DIR, PAIR_LOGIN, SERVER_URL } from "./server";
+import { computerName, safe } from "../shared/computer";
+import { b64, randomHex } from "../shared/crypto";
+import { DavError, withTimeout } from "../shared/dav";
+import { PAIR_DIR, PAIR_LOGIN, SERVER_URL } from "../shared/server";
 
 /**
  * Pairing: how this computer gets its own login on the backup server without anyone
@@ -39,7 +40,7 @@ export class Pairing {
 	private sawUnpaired = false;
 	private loggedClosed = false;
 
-	constructor(private plugin: VLBPlugin, private backup: Backup) {}
+	constructor(private owner: VaultLockApp, private backup: Backup) {}
 
 	/** True for a login this plugin made itself (as opposed to one the setup script wrote). */
 	static isDeviceLogin(user: string): boolean {
@@ -48,12 +49,12 @@ export class Pairing {
 
 	/** Makes up this computer's login on first start. Saved before the first request, so restarts reuse it. */
 	async ensureIdentity(): Promise<void> {
-		const s = this.plugin.settings;
+		const s = this.owner.settings;
 		if (s.webdavUser || s.webdavPass) return;
 		s.webdavUser = "d-" + randomHex(8);
 		s.webdavPass = randomHex(32);
 		try {
-			await this.plugin.saveSettings();
+			await this.owner.saveSettings();
 		} catch (e) {
 			// Never pair with a login that is not on disk: the next start would pair again as a new computer.
 			s.webdavUser = s.webdavPass = "";
@@ -118,7 +119,9 @@ export class Pairing {
 	}
 
 	private async sendRequest(): Promise<number> {
-		const s = this.plugin.settings;
+		// The core gave up on this copy of the app: no more requests.
+		if (this.owner.host.isAborted()) throw new DavError("stopped", 0);
+		const s = this.owner.settings;
 		const id = s.webdavUser.slice(2);
 		const body = JSON.stringify({
 			v: 1,
@@ -127,7 +130,7 @@ export class Pairing {
 			name: computerName(),
 			user: safe(() => os.userInfo().username),
 			os: process.platform,
-			plugin: this.plugin.manifest.version,
+			plugin: this.owner.manifest.version,
 		});
 		const r = await withTimeout(requestUrl({
 			url: `${SERVER_URL}${PAIR_DIR}/${id}.json`,
@@ -137,17 +140,5 @@ export class Pairing {
 			throw: false,
 		}), 30_000, "pairing request");
 		return r.status;
-	}
-}
-
-export function computerName(): string {
-	return safe(() => os.hostname().split(".")[0]) || "computer"; // "Laptop.local" -> "Laptop"
-}
-
-function safe(f: () => string): string {
-	try {
-		return f();
-	} catch {
-		return "";
 	}
 }
