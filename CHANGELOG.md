@@ -3,6 +3,41 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.7.0 — 2026-11-05
+
+A bad update can no longer stop the lock or the backup. Nothing new to see or set on the
+computer.
+
+- **Obsidian opens behind a cover until the lock is up.** The window is covered from the
+  first moment, also when the plugin's main part fails to start, and the cover comes down
+  only once the vault is locked. Typing and Obsidian's shortcuts do nothing under it.
+- **A small built-in fallback keeps the lock and the backup going.** If the plugin's main
+  part throws, hangs, or crashes twice within 90 seconds of a start, a minimal lock screen
+  and a plain backup take over (new and changed files every 10 minutes; nothing on the
+  server is ever deleted). The main part is tried again after 24 hours, or at once when a
+  new version arrives.
+- **The server can send signed fixes.** Only code signed with the project's update key
+  runs. It is checked again every time before it starts, a bundle that fails sends the
+  plugin back to its built-in code, and a newer release always wins over an older fix
+  unless the fix is forced. The server can also replace the plugin itself (`main.js`) for
+  the next start, after the same checks.
+- **Safe mode from the server.** The server can switch a computer to the fallback and back
+  (`vlb safemode on|off`).
+- **A stuck backup is noticed and handled.** When no backup run has finished for two hours
+  (by default) although the server provably takes writes from this computer, the plugin
+  switches to its fallback. A server that is down, full or refusing is never blamed on the plugin.
+- **One slow file no longer holds up the backup.** Files go up smallest first, and a file
+  the connection cannot push in time is counted as failed (`lastReconcile.failed`) while
+  the run goes on, instead of stopping it until the next try.
+- **Server files are never read stale from the cache.** Every request tells the browser
+  cache to stay out, so a changed `config.json` or `commands.json` is seen at the next
+  check. Before, it could be read from the cache for days.
+- The release has a fourth file, `app.js`: the plugin's main part alone, for the server.
+  BRAT ignores it.
+- `status.json` gains a `core` section (which code runs and how it is doing); `vlb status`
+  shows it as the "plugin code" lines. Server: `vlb key init|show`, `vlb bundle
+  fetch|publish|unpublish`, `vlb safemode on|off`.
+
 ## 1.6.2 — 2026-11-05
 
 Fixes that keep the backup running whatever happens on the computer.
