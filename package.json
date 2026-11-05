@@ -19,7 +19,7 @@
   "scripts": {
     "build": "node esbuild.config.mjs",
     "check": "tsc --noEmit -p tsconfig.json",
-    "test": "node scripts/smoke.mjs && bash scripts/test-roundtrip.sh"
+    "test": "node scripts/build-tests.mjs && node --test scripts/*.test.mjs && node scripts/smoke.mjs && bash scripts/test-roundtrip.sh"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",

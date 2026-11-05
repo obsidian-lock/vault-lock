@@ -92,12 +92,14 @@ export class LockScreen {
 			await new Promise((r) => setTimeout(r, Math.min(5000, 500 * this.failedAttempts)));
 			return false;
 		}
+		// Being stopped (a switch): the next app's lock screen is coming; never open the folder under it.
+		if (this.owner.stopping) return false;
 		this.failedAttempts = 0;
 		this.locked = false;
 		this.lastActivity = Date.now();
 		this.owner.backup.control.offerPassphrase(pass);
-		this.removeOverlay();
-		try { await this.owner.privateFolder.show(); } catch (e) { console.error("[VLB] unhide failed", e); }
+		this.removeOverlay(true);
+		try { await this.owner.privateFolder.show(() => this.owner.stopping); } catch (e) { console.error("[VLB] unhide failed", e); }
 		return true;
 	}
 
@@ -164,12 +166,14 @@ export class LockScreen {
 		g.observer.observe(doc.head, { subtree: true, childList: true, characterData: true });
 	}
 
-	private removeOverlay(): void {
+	/** Titles go back only on unlock. When the app stops while locked, the core's cover (or
+	 *  the next app's lock screen) is what keeps the note's name out of the title. */
+	private removeOverlay(restoreTitles: boolean): void {
 		if (this.scope) { this.owner.app.keymap.popScope(this.scope); this.scope = null; }
 		document.body.removeClass("vlb-locked");
 		for (const [doc, g] of this.titleGuards) {
 			g.observer.disconnect();
-			if (g.saved) doc.title = g.saved;
+			if (restoreTitles && g.saved) doc.title = g.saved;
 		}
 		this.titleGuards.clear();
 		this.overlay?.remove();
@@ -177,7 +181,7 @@ export class LockScreen {
 	}
 
 	destroy(): void {
-		this.removeOverlay();
+		this.removeOverlay(false);
 		this.locked = false;
 	}
 }

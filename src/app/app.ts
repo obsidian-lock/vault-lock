@@ -1,6 +1,7 @@
 import { Component } from "obsidian";
 import type { App as ObsidianApp, PluginManifest } from "obsidian";
 import css from "../../styles.css";
+import { HIDE_WAIT_MS } from "../shared/constants";
 import { API, App, Host } from "../shared/contract";
 import { PrivateFolder } from "../shared/privateFolder";
 import type { VLBSettings } from "../shared/settings";
@@ -55,12 +56,18 @@ export class VaultLockApp extends Component implements App {
 		const style = document.head.createEl("style", { text: css });
 		this.register(() => style.remove());
 
-		// If Obsidian crashed while unlocked, Private/ is still visible on disk: hide it
-		// again, then lock before the UI renders.
-		if (this.lockScreen.hasPass) {
-			try { await this.privateFolder.hide(); } catch (e) { console.error("[VLB] startup hide failed", e); }
-			if (this.stopping) return;
-			await this.lockScreen.lock();
+		// Test builds only (scripts/build-tests.mjs); "" in releases, so these lines are dead code.
+		if (__VLB_FAULT__ === "throw-start") throw new Error("test fault: throw-start");
+		if (__VLB_FAULT__ === "hang-start") await new Promise<void>(() => {});
+
+		// Lock before the UI renders. lock() puts the lock screen up at once and then hides the
+		// private folder (also when Obsidian crashed while unlocked and Private/ is still
+		// visible on disk). Locked is what the start needs: the hide (on Windows attrib over every
+		// file) goes on after it when slow, so a big folder never makes the start time out.
+		if (this.lockScreen.hasPass && __VLB_FAULT__ !== "never-lock") {
+			let t = 0;
+			await Promise.race([this.lockScreen.lock(), new Promise((r) => { t = window.setTimeout(r, HIDE_WAIT_MS); })]);
+			window.clearTimeout(t);
 		}
 		if (this.stopping) return;
 		this.lockScreen.install();

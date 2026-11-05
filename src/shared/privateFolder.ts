@@ -53,11 +53,13 @@ export class PrivateFolder {
 		});
 	}
 
-	show(): Promise<void> {
+	/** cancelled: asked when the show really runs (it may wait behind a hide); true → the folder stays hidden. */
+	show(cancelled: () => boolean = () => false): Promise<void> {
 		return this.serial(async () => {
-			if (!this.enabled) return;
+			if (!this.enabled || cancelled()) return;
 			// Unmark first, while Obsidian still ignores the dot-folder and sees no changes.
 			await this.setWindowsHidden(this.hiddenName, false);
+			if (cancelled()) return;
 			await this.rename(this.hiddenName, this.name, false);
 		});
 	}

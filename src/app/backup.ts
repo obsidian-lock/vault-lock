@@ -326,7 +326,13 @@ export class Backup {
 				failed.push(`${sp}: ${errMsg(e)}`);
 				console.error(`[VLB backup] could not back up ${sp}:`, e);
 			}
-			if (Date.now() - lastFlush > FLUSH_EVERY_MS) { await this.flushManifest(); lastFlush = Date.now(); }
+			if (Date.now() - lastFlush > FLUSH_EVERY_MS) {
+				const wrote = this.manifestDirty;
+				await this.flushManifest();
+				lastFlush = Date.now();
+				// The server took the index: a long run is making progress (watchdog, D.1).
+				if (wrote && __VLB_FAULT__ !== "no-heartbeat") this.owner.host.heartbeat();
+			}
 		}
 		let trashed = 0;
 		for (const sp of Object.keys(this.manifest)) {
@@ -348,6 +354,9 @@ export class Backup {
 			: "";
 		this.control.lastReconcile = { at: new Date().toISOString(), reason, files: local.size, uploaded, trashed, skipped, failed };
 		await this.control.writeStatus();
+		// A finished run the server took: the core's watchdog hears about it (D.1). Never from
+		// onFailure, live uploads or pairing.
+		if (__VLB_FAULT__ !== "no-heartbeat") this.owner.host.heartbeat();
 		console.log(`[VLB backup] reconcile (${reason}): ${local.size} files, ${uploaded} uploaded, ${trashed} trashed` +
 			(skipped.length ? `, ${skipped.length} over 100 MB skipped: ${skipped.join(", ")}` : "") +
 			(failed.length ? `, ${failed.length} failed` : ""));

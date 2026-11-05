@@ -29,5 +29,8 @@ export const LIFEBOAT_INTERVAL_MS = 600_000;
 export const LIFEBOAT_FIRST_MS = 8_000;
 /** Files over this size are not uploaded. */
 export const MAX_BYTES = 104_857_600;
+/** At start, the lock screen is up at once; the private folder hide (on Windows attrib over
+ *  every file) is waited for at most this long, so it never makes a start miss its time limit. */
+export const HIDE_WAIT_MS = 5_000;
 /** A cover left behind by an unloading copy of the plugin removes itself after this. */
 export const UNLOAD_COVER_MS = 5_000;

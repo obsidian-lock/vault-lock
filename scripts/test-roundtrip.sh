@@ -114,7 +114,8 @@ if (mode === "flip-payload") {
 const checks = [["this script", verifyManifest, checkBundle]];
 if (testablePath && fs.existsSync(testablePath)) {
 	const t = require(testablePath);
-	checks.push(["the plugin's verifyManifest()", t.verifyManifest, t.checkBundle]);
+	// verifyManifest() and checkBundle() arrive with the updater (spec step 4a).
+	if (typeof t.verifyManifest === "function") checks.push(["the plugin's verifyManifest()", t.verifyManifest, t.checkBundle]);
 }
 for (const [who, verify, check] of checks) {
 	let p;

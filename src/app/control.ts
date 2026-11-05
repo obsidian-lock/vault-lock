@@ -9,6 +9,7 @@ import { CONTROL, Entry, parentOf } from "../shared/vaultfiles";
  * WebDAV server, next to the backup:
  *
  *   config.json    written by the server, read by the plugin every reconcile; server wins
+ *                  (its "core" key is for the core and ignored here)
  *   commands.json  [{ id, cmd, paths? }]  executed once each (ids are remembered)
  *   status.json    written by the plugin after every reconcile and on a failure:
  *                  version, health, last run, command results
@@ -62,9 +63,20 @@ export class Control {
 			passphraseCopied: !!s.passHash && s.passCopied === s.passHash,
 			settings: { idleMinutes: s.idleMinutes, lockOnBlur: s.lockOnBlur, reconcileMinutes: s.reconcileMinutes, excludes: s.excludes.split("\n").filter(Boolean), privateFolder: s.privateFolder },
 			commands: s.commandLog,
+			core: this.coreStatus(),
 		};
 		await this.backup.ensureDir(CONTROL);
 		await this.backup.dav("PUT", STATUS, JSON.stringify(body, null, 2), { "Content-Type": "application/json" });
+	}
+
+	/** Which app the core runs, and its health (vlb status prints it). Never stops a status report. */
+	private coreStatus(): unknown {
+		try {
+			return this.owner.host.coreStatus();
+		} catch (e) {
+			console.warn("[VLB control] no core status:", e);
+			return null;
+		}
 	}
 
 	// ---- config ----------------------------------------------------------------
