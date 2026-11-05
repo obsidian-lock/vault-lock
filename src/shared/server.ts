@@ -12,4 +12,6 @@ export const PAIR_DIR = "_pair";
  * Public keys (Ed25519, SPKI DER as hex) that may sign app bundles sent by the server.
  * A list, so a key can be replaced by shipping a release with both.
  */
-export const UPDATE_PUBKEYS: string[] = [];
+export const UPDATE_PUBKEYS: string[] = [
+	"302a300506032b6570032100013ad6aaff6d668cd02419f35297d7008b4162e5d82186c7b7528f7386d302e4", // 2026-11-05
+];
