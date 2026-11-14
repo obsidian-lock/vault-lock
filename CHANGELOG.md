@@ -3,6 +3,16 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.7.1 — 2026-11-14
+
+- **Closing Obsidian locks the vault.** Closing Obsidian while it was unlocked left the
+  private folder visible on disk (in File Explorer, for example) until Obsidian was opened
+  again. Now the vault locks on the way out: the private folder is hidden before Obsidian
+  closes, and whatever was typed in an open private note is saved first.
+- Known limit: when Windows shuts down or restarts while Obsidian is open and unlocked,
+  Obsidian is ended without warning and the folder stays visible until Obsidian is opened
+  again. The idle lock (5 minutes by default) covers most of these cases.
+
 ## 1.7.0 — 2026-11-05
 
 A bad update can no longer stop the lock or the backup. Nothing new to see or set on the

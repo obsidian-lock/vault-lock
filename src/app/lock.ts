@@ -10,7 +10,8 @@ export class LockScreen {
 	private overlay: HTMLElement | null = null;
 	private scope: Scope | null = null;
 	private lastActivity = Date.now();
-	private busy = false;
+	/** The lock in progress, if any. */
+	private inflight: Promise<void> | null = null;
 	private failedAttempts = 0;
 	/** One title guard per window (main window and pop-outs) while locked. */
 	private titleGuards = new Map<Document, { saved: string; observer: MutationObserver }>();
@@ -67,20 +68,25 @@ export class LockScreen {
 		if (Date.now() - this.lastActivity >= m * 60_000) void this.lock();
 	}
 
-	async lock(): Promise<void> {
+	/** Resolves once the private folder is hidden. A lock already under way (a blur or idle lock
+	 *  just before Obsidian quits) returns that same lock, so the quit waits for its hide. */
+	lock(): Promise<void> {
 		// A stopped app never locks again (a blur timer can fire after stop): its lock screen would never go away.
-		if (this.owner.stopping) return;
-		if (!this.hasPass) { new Notice("Vault Lock: set a passphrase in settings first."); return; }
-		if (this.locked || this.busy) return;
-		this.busy = true;
+		if (this.owner.stopping) return Promise.resolve();
+		if (!this.hasPass) { new Notice("Vault Lock: set a passphrase in settings first."); return Promise.resolve(); }
+		if (this.inflight) return this.inflight;
+		if (this.locked) return Promise.resolve();
+		this.inflight = this.lockNow().finally(() => { this.inflight = null; });
+		return this.inflight;
+	}
+
+	private async lockNow(): Promise<void> {
 		try {
 			this.locked = true;
 			this.showOverlay();
 			await this.owner.privateFolder.hide();
 		} catch (e) {
 			console.error("[VLB] lock failed", e);
-		} finally {
-			this.busy = false;
 		}
 	}
 

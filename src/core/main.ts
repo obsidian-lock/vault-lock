@@ -56,6 +56,14 @@ export default class VaultLockPlugin extends Plugin {
 		this.addSettingTab(new VLBSettingTab(this.app, this));
 		// Obsidian closing or reloading the window is not a crash of the app that runs.
 		this.registerDomEvent(window, "beforeunload", () => this.supervisor.cleanExit());
+		// Closing Obsidian while unlocked used to leave the private folder visible on disk until
+		// the next start (seen on Windows, 2026-11-14). Lock on the way out: Obsidian waits for
+		// the task before it quits. A failed lock never holds up the quit.
+		this.registerEvent(this.app.workspace.on("quit", (tasks) => {
+			const current = this.supervisor.current;
+			if (!this.hasPass || !current) return;
+			tasks.add(() => current.lock().catch((e) => console.error("[VLB] locking at quit failed", e)));
+		}));
 
 		await this.supervisor.startBest();
 		if (this.unloaded) return;
