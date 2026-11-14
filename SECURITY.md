@@ -11,10 +11,12 @@ automatically.
 
 ## What counts as a vulnerability
 
-The plugin is a privacy screen and makes no encryption claims. These limits are known and by
-design:
+The plugin's encryption covers the private folder while the vault is locked: AES-256,
+every note encrypted on lock, decrypted on unlock. Everything else is a privacy screen
+with known limits, by design:
 
-- notes, including the private folder, are readable by anyone with access to the files;
+- notes outside the private folder, and the private folder while unlocked, are readable by
+  anyone with access to the files;
 - deleting the plugin's `data.json` removes the lock;
 - this computer's server key is stored in plain text in `data.json` (never uploaded);
 - since 1.6.0 the plugin sends the vault passphrase, on purpose, to the computer's own
