@@ -3,6 +3,12 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.8.0 — 2026-11-15
+
+- **A lock button.** A lock icon in Obsidian's left ribbon locks the vault with one click,
+  the same as the *Lock vault now* command. Unlocking stays on the lock screen's own
+  *Unlock* button.
+
 ## 1.7.1 — 2026-11-14
 
 - **Closing Obsidian locks the vault.** Closing Obsidian while it was unlocked left the

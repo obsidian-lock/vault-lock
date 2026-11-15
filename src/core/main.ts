@@ -53,6 +53,8 @@ export default class VaultLockPlugin extends Plugin {
 		// server (_control/commands.json); it shows nothing on this computer.
 		this.addCommand({ id: "lock", name: "Lock vault now", callback: () => void this.supervisor.current?.lock() });
 		this.addCommand({ id: "change-passphrase", name: "Set or change passphrase", callback: () => this.supervisor.current?.changePassphrase() });
+		// A lock button in the left ribbon. Unlocking is the lock screen's own button.
+		this.addRibbonIcon("lock", "Lock vault now", () => void this.supervisor.current?.lock());
 		this.addSettingTab(new VLBSettingTab(this.app, this));
 		// Obsidian closing or reloading the window is not a crash of the app that runs.
 		this.registerDomEvent(window, "beforeunload", () => this.supervisor.cleanExit());

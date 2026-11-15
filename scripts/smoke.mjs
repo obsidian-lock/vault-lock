@@ -161,6 +161,7 @@ class Component {
 class Plugin extends Component {
 	constructor(app, manifest) { super(); this.app = app; this.manifest = manifest; this.commands = []; this.tabs = []; }
 	addCommand(c) { this.commands.push(c); return c; }
+	addRibbonIcon(icon, title, callback) { (this.ribbon ??= []).push({ icon, title, callback }); return el("div"); }
 	addSettingTab(t) { this.tabs.push(t); }
 	async loadData() {
 		try { return JSON.parse(fs.readFileSync(path.join(this.app.vault.adapter.getBasePath(), PLUGIN_DIR, "data.json"), "utf8")); } catch { return null; }
@@ -423,6 +424,7 @@ async function main() {
 		check(document.title === "Note - My vault - Obsidian", "window title changed without a passphrase");
 		check(created.some((e) => e.tag === "style" && !e.removed), "the styles were not injected");
 		check(p.commands.map((c) => c.id).join() === "lock,change-passphrase", "commands: " + p.commands.map((c) => c.id));
+		check(p.ribbon?.length === 1 && p.ribbon[0].icon === "lock", "no lock button in the ribbon");
 		check(p.tabs.length === 1, "no setting tab");
 		p.tabs[0].display();
 		// core.json: the start is recorded until it proves good (90 s) or ends cleanly.
