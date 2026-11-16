@@ -3,6 +3,43 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.9.0 — 2026-11-16
+
+The private folder is now encrypted on disk while the vault is locked. Nothing to set on the
+computer.
+
+- **The private folder is encrypted while locked.** A few seconds after a lock, every file
+  in the private folder up to 100 MB is encrypted with AES-256-GCM (WebCrypto, built into
+  Obsidian) into `name.vlenc`. Each encrypted copy is read back and checked before the
+  readable file is removed. Unlocking decrypts every file, keeps its modification time, and
+  the lock screen shows "Unlocking… n of N" meanwhile. Larger files stay hidden only.
+- **Nothing is lost when Obsidian or the computer stops half-way.** Every step leaves
+  either the readable file or a checked encrypted copy on disk; the next lock or start
+  finishes what was interrupted. A file that cannot be decrypted is moved aside, never
+  deleted.
+- **The key comes from the server.** The server makes one key per paired computer and
+  keeps it; the plugin keeps a copy in its settings (`data.json` and `data.bak.json`). Until
+  both files hold it, the folder is hidden only, as before.
+- **The backup leaves the private folder alone while locked**, so encrypted files never
+  replace the readable copies on the server. A restore sent while locked writes the private
+  files at the first backup run after the next unlock.
+- **Closing Obsidian waits for the encryption** (up to 20 seconds); anything left is
+  finished at the next start.
+- **A lock during an unlock wins.** Locking, or closing Obsidian, while the passphrase is
+  checked or the folder is being decrypted stops the unlock: the window stays locked and
+  what was decrypted is encrypted again.
+- **Files that appear in the private folder while locked** (a link click, another program)
+  are moved into it at the next lock or unlock; a name already taken gets
+  "(created while locked)".
+- Do not install an older version by hand once 1.9.0 has run: older versions cannot read
+  the encrypted files.
+- Server: `vlb encrypt on|off` switches encryption per computer (on by default), `vlb
+  vaultkey COMPUTER` prints a computer's key, `vlb status` gains an "encryption" line, and
+  `vlb bundle publish` refuses versions below 1.9.0.
+- Known limits: the private folder is readable while unlocked; anyone who can read the
+  plugin's `data.json` has the key; file names inside the hidden folder stay visible to
+  someone who shows hidden files.
+
 ## 1.8.0 — 2026-11-15
 
 - **A lock button.** A lock icon in Obsidian's left ribbon locks the vault with one click,

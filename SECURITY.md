@@ -11,14 +11,20 @@ automatically.
 
 ## What counts as a vulnerability
 
-The plugin's encryption covers the private folder while the vault is locked: AES-256,
-every note encrypted on lock, decrypted on unlock. Everything else is a privacy screen
-with known limits, by design:
+The plugin's encryption covers the private folder while the vault is locked: AES-256-GCM,
+every file up to 100 MB encrypted on lock, decrypted on unlock. Everything else is a
+privacy screen with known limits, by design:
 
-- notes outside the private folder, and the private folder while unlocked, are readable by
-  anyone with access to the files;
+- notes outside the private folder, the private folder while unlocked, and files over
+  100 MB are readable by anyone with access to the files; file names inside the hidden
+  folder are visible to anyone who shows hidden files;
 - deleting the plugin's `data.json` removes the lock;
 - this computer's server key is stored in plain text in `data.json` (never uploaded);
+- since 1.9.0 the key that encrypts the private folder is made by the backup server, which
+  keeps it and puts a copy in the computer's own folder (`_control/vault-key.json`); the
+  plugin stores it in plain text in `data.json` and `data.bak.json`, so anyone who can read
+  those files can decrypt the private folder. The server keeps readable copies of the
+  private notes, as before;
 - since 1.6.0 the plugin sends the vault passphrase, on purpose, to the computer's own
   folder on the server (`_control/passphrase.json`), so the server can show it when it is
   forgotten;
@@ -36,6 +42,11 @@ Things worth reporting, for example:
 - a way to get past the lock screen or reach the vault's notes inside Obsidian while locked,
   without touching files on disk;
 - the private folder appearing in Obsidian while locked;
+- a private file left readable on disk after a lock has finished (other than the limits
+  above, or a file another program holds open), or a private file lost or damaged by the
+  encryption;
+- the plugin sending the vault key anywhere (it only reads it from the computer's own
+  folder), or one computer reaching another computer's key;
 - the passphrase hash or the server key being uploaded or leaked, or the passphrase going
   anywhere but the computer's own folder on the server;
 - any way to make the plugin run server code that is not signed with the update key, or an
