@@ -54,6 +54,10 @@ export class PrivateFolder {
 
 	private gen = 0;
 	private queued = false;
+	/** dispose() ran: no pass is ever queued again (the next copy of the plugin has its own). */
+	private disposed = false;
+	/** The last pass only hid (no key, or encryption off): plaintext is still under the hidden folder. */
+	private lastHideOnly = false;
 	/** A pass has started and not yet decided about its pause (finishLock() can still make it skip). */
 	private prePause = false;
 	private skipOnce = false;
@@ -123,6 +127,13 @@ export class PrivateFolder {
 	encryptionReady(): boolean {
 		const s = this.settings();
 		return this.enabled && s.encrypt && !!s.vaultKey && this.keyDurable;
+	}
+
+	/** The last pass left the hidden folder plaintext (no key or encryption off then) and it could
+	 *  be encrypted now: the switch or the key arrived by another road than applyConfig's edge
+	 *  (the core's tick writes the same setting). Cheap: no disk read. */
+	leftPlain(): boolean {
+		return this.lastHideOnly && this.encryptionReady();
 	}
 
 	stats(): EncStats {
@@ -201,11 +212,18 @@ export class PrivateFolder {
 	}
 
 	/** Ends a pause that sleeps now, makes a queued pass skip its pause, and resolves when the
-	 *  jobs queued so far are done. One-shot: the next lock pauses again. Never rejects. */
-	finishLock(): Promise<void> {
-		this.wake?.();
-		if (this.queued || this.prePause) this.skipOnce = true;
-		return this.tail().catch(() => {});
+	 *  jobs queued so far are done, plus the pass a running hide() queues as it ends (on Windows
+	 *  its attrib call is slow enough that the pass is not queued yet when this is called).
+	 *  One-shot: the next lock pauses again. Never rejects. */
+	async finishLock(): Promise<void> {
+		const { chains, key } = this.store();
+		for (let i = 0; i < 4; i++) {
+			this.wake?.();
+			if (this.queued || this.prePause) this.skipOnce = true;
+			const t = chains[key];
+			await (t ?? Promise.resolve()).catch(() => {});
+			if (chains[key] === t && !this.queued && !this.prePause) return;
+		}
 	}
 
 	/** Encrypt a hidden folder now (the key arrived, or encryption was turned on). */
@@ -214,8 +232,11 @@ export class PrivateFolder {
 	}
 
 	/** The app stops: end the pause, stop at the next file, and wait for the jobs queued so far
-	 *  (not for the ones the next copy of the plugin may have queued behind them). */
+	 *  (not for the ones the next copy of the plugin may have queued behind them). From now on
+	 *  nothing queues a pass here: a key or switch that arrives as the app stops is the next
+	 *  copy's job, not an uncancellable pass on a stopped one. */
 	dispose(): Promise<void> {
+		this.disposed = true;
 		this.cancelPasses();
 		this.clearRetry();
 		return this.tail().catch(() => {});
@@ -268,7 +289,7 @@ export class PrivateFolder {
 	}
 
 	private scheduleRetry(): void {
-		if (this.retryTimer) return;
+		if (this.retryTimer || this.disposed) return;
 		this.retryTimer = window.setTimeout(() => {
 			this.retryTimer = null;
 			this.kick(true);
@@ -277,7 +298,7 @@ export class PrivateFolder {
 
 	/** Queue one encryption pass; one waiting pass is enough, however often this is asked. */
 	private kick(now: boolean): void {
-		if (this.queued) return;
+		if (this.queued || this.disposed) return;
 		this.queued = true;
 		const g = this.gen;
 		void this.serial(() => this.pass(now, g).catch((e) => console.error("[VLB] encryption pass failed", e)));
@@ -289,7 +310,7 @@ export class PrivateFolder {
 		// The generation is read after the await: a show() or dispose() that lands during it
 		// must not be followed by the 5 s pause.
 		const hidden = await this.app.vault.adapter.exists(this.hiddenName);
-		if (g !== this.gen || !hidden) {
+		if (g !== this.gen || this.disposed || !hidden) {
 			this.prePause = false;
 			if (!this.queued) this.skipOnce = false; // nothing waits for it any more
 			return;
@@ -311,6 +332,7 @@ export class PrivateFolder {
 		} finally {
 			await this.setWindowsHidden(this.hiddenName, true, true);
 		}
+		this.lastHideOnly = !ready;
 		// Hide-only passes (no key yet) are not retried: nothing would change.
 		if (ready && this.failed.length && g === this.gen) this.scheduleRetry();
 	}
@@ -463,7 +485,9 @@ export class PrivateFolder {
 		return out;
 	}
 
-	/** x.vlenc.tmp is ours only while its source (x or x.vlenc) is there; otherwise it is kept and reported. */
+	/** x.vlenc.tmp is ours only while its source (x or x.vlenc) is there; otherwise it is kept and
+	 *  reported. The pair rule's sibling (C.5) is written through the pair's own x.vlenc.tmp, so a
+	 *  crash in the middle of it leaves exactly this: x, x.vlenc and the temp file. */
 	private async cleanTmps(list: Found[]): Promise<void> {
 		for (const t of list) {
 			if (!t.isTmp) continue;
@@ -595,14 +619,33 @@ export class PrivateFolder {
 		const dot = base.lastIndexOf(".");
 		const ext = dot > 0 ? base.slice(dot) : "";
 		const stem = xAbs.slice(0, xAbs.length - ext.length);
-		const target = await this.freeName(`${stem} (recovered ${stamp()})`, ext);
-		// Through its own temporary file; one left by a crash is reported as an orphan, never deleted.
-		const tmp = target + ".vlenc.tmp";
+		const S = stamp();
+		// Through the pair's own temporary file (x.vlenc.tmp): its source x.vlenc exists until the
+		// end, so a crash leaves what C.3's temp rule cleans up, never an orphan with readable text.
+		const tmp = enc + ".tmp";
 		await this.unlinkIfExists(tmp);
 		await this.writeNew(tmp, d.plain);
-		await this.setMtime(tmp, d.header.mtime);
-		if (await this.lexists(target)) throw new Error(`${path.basename(target)} appeared meanwhile`);
-		await this.fsRetry(() => fsp.rename(tmp, target));
+		let target: string;
+		try {
+			await this.setMtime(tmp, d.header.mtime);
+			try {
+				target = await this.freeName(`${stem} (recovered ${S})`, ext);
+				if (await this.lexists(target)) throw new Error(`${path.basename(target)} appeared meanwhile`);
+				await this.fsRetry(() => fsp.rename(tmp, target));
+			} catch (e) {
+				// The long sibling name is too much for this disk (Windows says ENOENT for that, with
+				// the temp file still there): a short one in the same folder.
+				const code = (e as NodeJS.ErrnoException).code;
+				if (code !== "ENAMETOOLONG" && !(code === "ENOENT" && (await this.lexists(tmp)))) throw e;
+				target = await this.freeName(path.dirname(xAbs) + path.sep + `recovered ${S}`, ext);
+				if (await this.lexists(target)) throw new Error(`${path.basename(target)} appeared meanwhile`);
+				await this.fsRetry(() => fsp.rename(tmp, target));
+			}
+		} catch (e) {
+			// Nothing is lost: the text is still in enc. The half-made sibling goes (B3: its source exists).
+			await this.unlinkIfExists(tmp).catch(() => {});
+			throw e;
+		}
 		await this.fsRetry(() => fsp.unlink(enc));
 		this.recovered++;
 		const rel = `${parentOf(xRel)}/${path.basename(target)}`;
@@ -639,19 +682,24 @@ export class PrivateFolder {
 		const files: string[] = [];
 		const folders: string[] = [];
 		await this.listTree(V, files, folders);
-		const listed = new Map<string, Set<string>>(); // H/dir → names there (one listing per folder)
+		// Names are compared as the disk compares them where that matters (NTFS and APFS ignore
+		// case; a stray "secret.md" beside "Secret.md.vlenc" would otherwise take the real note's
+		// name and win the pair rule at the unlock): folded, which on a case-sensitive disk only
+		// costs a "(created while locked)" suffix where none was needed.
+		const fold = (n: string) => n.normalize("NFC").toLowerCase();
+		const listed = new Map<string, Set<string>>(); // H/dir → folded names there (one listing per folder)
 		const names = async (dir: string): Promise<Set<string>> => {
 			let s = listed.get(dir);
 			if (!s) {
 				s = new Set<string>();
-				try { for (const e of await fsp.readdir(this.abs(dir))) s.add(e); } catch { /* not there yet */ }
+				try { for (const e of await fsp.readdir(this.abs(dir))) s.add(fold(e)); } catch { /* not there yet */ }
 				listed.set(dir, s);
 			}
 			return s;
 		};
 		const taken = async (t: string): Promise<boolean> => {
 			const s = await names(parentOf(t));
-			const b = path.basename(t);
+			const b = fold(path.basename(t));
 			return s.has(b) || s.has(b + ".vlenc") || s.has(b + ".vlenc.tmp") || [...s].some((n) => n.startsWith(b + ".undecryptable-"));
 		};
 		let moved = 0, left = 0;
@@ -662,26 +710,27 @@ export class PrivateFolder {
 			const dot = base.lastIndexOf(".");
 			const ext = dot > 0 ? base.slice(dot) : "";
 			const stem = base.slice(0, base.length - ext.length);
-			let target = `${dir}/${base}`;
-			if (await taken(target)) {
-				for (let n = 1; ; n++) {
-					target = `${dir}/${stem} (created while locked)${n === 1 ? "" : `-${n}`}${ext}`;
-					if (!(await taken(target))) break;
-				}
-			}
 			const move = async (to: string): Promise<void> => {
 				await this.mkdirs(parentOf(to));
 				if (await this.lexists(this.abs(to))) throw new Error(`${to} appeared meanwhile`);
 				await this.fsRetry(() => adapter.rename(rel, to));
-				(await names(parentOf(to))).add(path.basename(to));
+				(await names(parentOf(to))).add(fold(path.basename(to)));
 				moved++;
 				await fault("merge:after-move");
 			};
 			try {
 				try {
+					let target = `${dir}/${base}`;
+					if (await taken(target)) {
+						for (let n = 1; ; n++) {
+							target = `${dir}/${stem} (created while locked)${n === 1 ? "" : `-${n}`}${ext}`;
+							if (!(await taken(target))) break;
+						}
+					}
 					await move(target);
 				} catch (e) {
 					if ((e as NodeJS.ErrnoException).code !== "ENAMETOOLONG") throw e;
+					let target = "";
 					for (let n = 1; ; n++) {
 						target = `${dir}/created while locked ${n}${ext}`;
 						if (!(await taken(target))) break;
@@ -800,14 +849,11 @@ export class PrivateFolder {
 		}
 	}
 
-	/** The first 7 bytes are the magic and the version. */
+	/** The first 7 bytes are the magic and the version. A file that cannot be opened or read (held
+	 *  by another program, too many handles) throws: the caller counts it as a per-file failure and
+	 *  leaves it alone, since calling it plaintext would encrypt a .vlenc twice and skip it at the unlock. */
 	private async hasMagic(abs: string): Promise<boolean> {
-		let fh: fs.promises.FileHandle;
-		try {
-			fh = await fsp.open(abs, "r");
-		} catch {
-			return false;
-		}
+		const fh = await fsp.open(abs, "r");
 		try {
 			const buf = new Uint8Array(7);
 			const { bytesRead } = await fh.read(buf, 0, 7, 0);

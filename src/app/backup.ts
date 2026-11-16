@@ -170,16 +170,6 @@ export class Backup {
 		this.knownDirs.clear();
 	}
 
-	/** Local path for a server path: inside the private folder, that is the hidden name while locked. */
-	async toLocal(sp: string): Promise<string> {
-		const pf = this.owner.privateFolder;
-		if (!pf.enabled) return sp;
-		if (sp === pf.name || sp.startsWith(pf.name + "/")) {
-			if (await this.owner.app.vault.adapter.exists(pf.hiddenName)) return pf.hiddenName + sp.slice(pf.name.length);
-		}
-		return sp;
-	}
-
 	scheduleInterval(): void {
 		if (this.stopped) return; // a stopped copy (after a reload) must not re-arm its timer
 		if (this.intervalTimer) window.clearTimeout(this.intervalTimer);

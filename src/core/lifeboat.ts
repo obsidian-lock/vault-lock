@@ -1,5 +1,5 @@
 import { Component, Notice, Scope } from "obsidian";
-import { MAX_BYTES, LIFEBOAT_FIRST_MS, LIFEBOAT_INTERVAL_MS } from "../shared/constants";
+import { HIDE_RETRY_MS, MAX_BYTES, LIFEBOAT_FIRST_MS, LIFEBOAT_INTERVAL_MS } from "../shared/constants";
 import { API, App, Host } from "../shared/contract";
 import { computerName } from "../shared/computer";
 import { hashPass, safeEqual } from "../shared/crypto";
@@ -17,9 +17,10 @@ import { CONTROL, excluded, Index, LocalFile, MANIFEST, parentOf, scan } from ".
  *
  * The private folder: hidden and encrypted while locked when data.json already holds the key
  * (the lifeboat never fetches one), hidden only otherwise; every unlock decrypts. Its backup
- * never lists the hidden folder, skips the visible one while it is hidden, and never uploads a
- * note that has an encrypted form beside it. The encryption switch reaches it through the
- * core's config poll.
+ * never lists the hidden folder, skips the visible one while it is hidden or while a restore
+ * still owes private files (the full app's gate, B6/B8: the lifeboat has no exceptions), and
+ * never uploads a note that has an encrypted form beside it. The encryption switch reaches it
+ * through the core's config poll.
  */
 
 const IDLE_CHECK_MS = 15_000;
@@ -46,6 +47,9 @@ export class Lifeboat extends Component implements App {
 	/** An unlock is decrypting: the overlay stays up and isLocked stays true until the folder is back. */
 	unlocking = false;
 	lockRequested = false;
+	/** The passphrase is being checked (a few hundred ms): a lock() meanwhile wins over the unlock that would follow. */
+	private checking = false;
+	private hideTimer: number | null = null;
 	private lockedAtUnload = false;
 	private overlay: HTMLElement | null = null;
 	private err: HTMLElement | null = null;
@@ -76,7 +80,7 @@ export class Lifeboat extends Component implements App {
 		if (this.hasPass) {
 			this.lockNow();
 			// Resolves after the rename; the encryption goes on in the background.
-			try { await this.pf.hide(); } catch (e) { console.error("[VLB lifeboat] hiding the private folder failed", e); }
+			await this.hideNow();
 		}
 		if (this.stopping) return;
 		const touch = () => { this.lastActivity = Date.now(); };
@@ -104,6 +108,8 @@ export class Lifeboat extends Component implements App {
 	private async finish(): Promise<void> {
 		this.stopping = true;
 		window.clearTimeout(this.firstTimer);
+		if (this.hideTimer) window.clearTimeout(this.hideTimer);
+		this.hideTimer = null;
 		// The encryption pass stops at its next file whatever the network does.
 		await Promise.allSettled([this.pf.dispose(), (async () => {
 			try { await this.inflight; } catch { /* reported by run() */ }
@@ -131,6 +137,8 @@ export class Lifeboat extends Component implements App {
 	async lock(): Promise<void> {
 		if (this.stopping) return;
 		if (!this.hasPass) { new Notice("Vault Lock: no passphrase is set."); return; }
+		// The passphrase is still being checked: the vault is locked, and the unlock stops once the check is done.
+		if (this.checking && this.isLocked) { this.lockRequested = true; return; }
 		if (this.unlocking && this.unlockDone) {
 			this.lockRequested = true;
 			await this.unlockDone;
@@ -138,7 +146,26 @@ export class Lifeboat extends Component implements App {
 			return;
 		}
 		this.lockNow();
-		try { await this.pf.hide(); } catch (e) { console.error("[VLB lifeboat] hiding the private folder failed", e); }
+		await this.hideNow();
+	}
+
+	/** Hide the private folder; a failed rename (a file held open) is tried again every HIDE_RETRY_MS while locked. Never rejects. */
+	private async hideNow(): Promise<void> {
+		try {
+			await this.pf.hide();
+		} catch (e) {
+			console.error("[VLB lifeboat] hiding the private folder failed", e);
+			this.hideRetry();
+		}
+	}
+
+	private hideRetry(): void {
+		if (this.hideTimer) return;
+		this.hideTimer = window.setTimeout(() => {
+			this.hideTimer = null;
+			if (!this.isLocked || this.unlocking || this.stopping) return;
+			void this.hideNow();
+		}, HIDE_RETRY_MS);
 	}
 
 	finishLock(): Promise<void> {
@@ -228,7 +255,14 @@ export class Lifeboat extends Component implements App {
 	 *  private folder came back (a failed or cancelled show keeps the overlay and re-hides). */
 	async tryUnlock(pass: string): Promise<boolean> {
 		const s = this.host.settings;
-		const h = await hashPass(pass, s.passSalt);
+		this.lockRequested = false;
+		this.checking = true;
+		let h: string;
+		try {
+			h = await hashPass(pass, s.passSalt);
+		} finally {
+			this.checking = false;
+		}
 		if (!safeEqual(h, s.passHash)) {
 			this.attempts++;
 			await new Promise((r) => setTimeout(r, Math.min(5000, 500 * this.attempts)));
@@ -236,8 +270,9 @@ export class Lifeboat extends Component implements App {
 		}
 		if (this.stopping) return false;
 		this.attempts = 0;
+		// A lock asked for while the passphrase was checked wins: nothing is opened (B15).
+		if (this.lockRequested) { if (this.err) this.err.textContent = "Locked again."; return true; }
 		this.unlocking = true;
-		this.lockRequested = false;
 		this.pf.progress = (t) => { if (this.err) this.err.textContent = t ?? ""; };
 		let done = false;
 		this.unlockDone = (async () => {
@@ -250,7 +285,7 @@ export class Lifeboat extends Component implements App {
 				if (this.err) this.err.textContent = `The private folder could not be opened: ${errMsg(e)}. Try again.`;
 			}
 			if (!done && !this.stopping) {
-				this.rehide = this.pf.hide().catch((e) => console.error("[VLB lifeboat] hiding the private folder failed", e)).finally(() => { this.rehide = null; });
+				this.rehide = this.hideNow().finally(() => { this.rehide = null; });
 			}
 		})();
 		await this.unlockDone;
@@ -303,8 +338,10 @@ export class Lifeboat extends Component implements App {
 			const adapter = this.host.app.vault.adapter;
 			const ownDir = this.host.manifest.dir ?? this.host.app.vault.configDir + "/plugins/" + this.host.manifest.id;
 			const local = new Map<string, LocalFile>();
-			// Never the hidden folder; not the visible one either while it is hidden (a lock mid-scan included).
-			const hidden = this.pf.enabled && (await adapter.exists(this.pf.hiddenName));
+			// Never the hidden folder; not the visible one either while it is hidden (a lock mid-scan
+			// included) or while a restore still owes private files: an older local note would be PUT
+			// over the newer server copy the deferred restore is about to bring back (B6/B8).
+			const hidden = this.pf.enabled && ((await adapter.exists(this.pf.hiddenName)) || s.restoreDeferred.length > 0);
 			await scan(adapter, "", local, (p) => excluded(p, ownDir, s.excludes) || this.pf.isHiddenPath(p) || (hidden && this.pf.isPrivatePath(p)), (p) => this.pf.toVisible(p));
 
 			let uploaded = 0;

@@ -1,6 +1,7 @@
 import type { VaultLockApp } from "./app";
 import type { Backup } from "./backup";
 import { computerName } from "../shared/computer";
+import { DavError, errMsg } from "../shared/dav";
 import { CmdResult, DeferredRestore } from "../shared/settings";
 import { CONTROL, Entry, parentOf } from "../shared/vaultfiles";
 
@@ -28,7 +29,10 @@ import { CONTROL, Entry, parentOf } from "../shared/vaultfiles";
  * its private files are remembered in settings.restoreDeferred (saved before the command is
  * marked done) and written at the first reconcile after the next unlock, with the same rules
  * as the command itself. Until then the backup leaves everything under the private folder
- * alone, so an older local note can never be uploaded over the newer server copy.
+ * alone, so an older local note can never be uploaded over the newer server copy. The deferred
+ * run clears its record after one complete pass: a file of its own that cannot be restored (a
+ * stale index key, a server copy that changed, a name this disk refuses) is listed in the
+ * command's result, while server or login trouble leaves the record for the next run.
  */
 
 const CONFIG = `${CONTROL}/config.json`;
@@ -61,6 +65,9 @@ export class Control {
 
 	async pull(): Promise<void> {
 		await this.applyConfig();
+		// The core's tick applies the same switch (it writes the very setting applyConfig compares
+		// with), so the edge above can be missed: whatever a hide-only pass left is encrypted now.
+		if (this.owner.privateFolder.leftPlain()) this.owner.privateFolder.requestEncrypt();
 		await this.runCommands();
 		await this.sendPassphrase(); // a copy that could not be sent earlier (not paired yet, server unreachable)
 		await this.fetchVaultKey(); // last: the three above never wait on it
@@ -309,43 +316,62 @@ export class Control {
 		}
 	}
 
-	/** A restore into a vault whose private folder is not hidden while the window is locked (no
-	 *  folder at all before): the files were written visible; hide and encrypt them now. */
+	/** A restore wrote private files visible while the window is locked (no hidden folder before
+	 *  the restore, or a lock that landed during it): hide and encrypt them now. hide() merges a
+	 *  visible folder into the hidden one when both exist. A rename that fails is retried by the
+	 *  lock screen every HIDE_RETRY_MS and never fails the command: its files were written. */
 	private async hideIfLocked(): Promise<void> {
 		const wrote = this.wrotePrivate;
 		this.wrotePrivate = false;
-		const pf = this.owner.privateFolder;
-		if (!wrote || !pf.enabled || !this.owner.lockScreen.locked) return;
-		if (await this.owner.app.vault.adapter.exists(pf.hiddenName)) return;
-		await pf.hide();
+		if (!wrote || !this.owner.privateFolder.enabled || !this.owner.lockScreen.locked) return;
+		await this.owner.lockScreen.ensureHidden();
 	}
 
 	/** Set by writeFromServer when a private file was written visible; read by hideIfLocked. */
 	private wrotePrivate = false;
 
 	/** The private files a restore-all or pull left for after the unlock: written at the first
-	 *  reconcile that finds the folder visible, with the command's own rules. A throw leaves the
-	 *  record in place (tried again next run); the gate stays closed meanwhile. */
+	 *  reconcile that finds the folder visible, with the command's own rules. Server or login
+	 *  trouble (a throw) leaves the record in place (tried again next run) and the gate stays
+	 *  closed meanwhile; one file's own trouble is listed and the others go on, so a record never
+	 *  outlives one complete pass (the gate would otherwise stay shut for good). */
 	async runDeferredRestore(): Promise<void> {
 		const s = this.owner.settings;
 		const pf = this.owner.privateFolder;
 		if (!s.restoreDeferred.length || !pf.enabled) return;
 		if (await this.owner.app.vault.adapter.exists(pf.hiddenName)) return; // still locked: wait
 		this.wrotePrivate = false;
-		for (const d of s.restoreDeferred.slice()) {
-			await this.backup.loadManifest();
-			const m = this.backup.manifest;
-			let keys = Object.keys(m).filter((k) => pf.isPrivateServerPath(k));
-			if (d.cmd === "pull") keys = keys.filter((k) => (d.paths ?? []).some((p) => k === p || k.startsWith(p + "/")));
-			const n = { written: 0, kept: 0, refused: 0, deferred: 0 };
-			for (const k of keys) this.tally(n, await this.writeFromServer(k, m[k], d.cmd === "pull"), d);
-			this.wrotePrivate = false;
-			if (n.deferred) { console.log(`[VLB control] deferred ${d.cmd} (${d.id}): locked again meanwhile; the rest waits for the next unlock`); break; }
-			s.restoreDeferred = s.restoreDeferred.filter((x) => x !== d);
-			const log = s.commandLog[d.id];
-			if (log) log.detail = (log.detail ?? "") + `; deferred private files: ${n.written} written, ${n.kept} newer local kept`;
-			await this.owner.saveSettings();
-			console.log(`[VLB control] deferred ${d.cmd} (${d.id}): ${n.written} private files written, ${n.kept} newer local kept`);
+		try {
+			for (const d of s.restoreDeferred.slice()) {
+				await this.backup.loadManifest();
+				const m = this.backup.manifest;
+				let keys = Object.keys(m).filter((k) => pf.isPrivateServerPath(k));
+				if (d.cmd === "pull") keys = keys.filter((k) => (d.paths ?? []).some((p) => k === p || k.startsWith(p + "/")));
+				const n = { written: 0, kept: 0, refused: 0, deferred: 0 };
+				const failed: string[] = [];
+				for (const k of keys) {
+					try {
+						this.tally(n, await this.writeFromServer(k, m[k], d.cmd === "pull"), d);
+					} catch (e) {
+						if (!perFile(e)) throw e;
+						failed.push(`${k}: ${errMsg(e)}`);
+					}
+				}
+				if (n.deferred) { console.log(`[VLB control] deferred ${d.cmd} (${d.id}): locked again meanwhile; the rest waits for the next unlock`); break; }
+				s.restoreDeferred = s.restoreDeferred.filter((x) => x !== d);
+				const note = `; deferred private files: ${n.written} written, ${n.kept} newer local kept` + (failed.length ? `, ${failed.length} not restored: ${failed.join("; ")}` : "");
+				const log = s.commandLog[d.id];
+				if (log) log.detail = (log.detail ?? "") + note;
+				await this.owner.saveSettings();
+				console.log(`[VLB control] deferred ${d.cmd} (${d.id})` + note);
+				if (failed.length) {
+					this.configError = `deferred ${d.cmd} (${d.id}): ${failed.length} private file(s) not restored: ${failed.slice(0, 3).join("; ")}`;
+					console.warn("[VLB control] " + this.configError);
+				}
+			}
+		} finally {
+			// A lock that landed during the run: what was written visible is hidden again.
+			await this.hideIfLocked();
 		}
 	}
 
@@ -369,9 +395,11 @@ export class Control {
 		}
 		const adapter = this.owner.app.vault.adapter;
 		const pf = this.owner.privateFolder;
-		// Never into the hidden folder: it waits for the first reconcile after the unlock.
-		if (pf.isPrivateServerPath(sp) && (await adapter.exists(pf.hiddenName))) return "deferred";
-		const local = await this.backup.toLocal(sp);
+		const isPrivate = pf.isPrivateServerPath(sp);
+		// Never into the hidden folder: it waits for the first reconcile after the unlock. While
+		// the folder is not hidden, the local path is the server path.
+		if (isPrivate && (await adapter.exists(pf.hiddenName))) return "deferred";
+		const local = sp;
 		const st = await adapter.stat(local);
 		const haveLocal = !!st && st.type === "file";
 		if (!force && haveLocal) {
@@ -380,22 +408,34 @@ export class Control {
 		}
 
 		const r = await this.backup.dav("GET", sp);
-		if (r.status === 404) throw new Error(`${sp} missing on server`);
-		if (r.arrayBuffer.byteLength !== e.s) throw new Error(`${sp}: the server copy is ${r.arrayBuffer.byteLength} bytes, the index says ${e.s}`);
+		if (r.status === 404) throw new RestoreFileError(`${sp} missing on server`);
+		if (r.arrayBuffer.byteLength !== e.s) throw new RestoreFileError(`${sp}: the server copy is ${r.arrayBuffer.byteLength} bytes, the index says ${e.s}`);
 
 		if (haveLocal) {
 			// Never lose the local version: park it in the server trash before overwriting.
-			const data = await adapter.readBinary(local);
+			let data: ArrayBuffer;
+			try {
+				data = await adapter.readBinary(local);
+			} catch (err) {
+				throw new RestoreFileError(`${sp}: the local copy cannot be read: ${errMsg(err)}`);
+			}
 			const dest = `_trash/${this.backup.stamp()}/${sp}`;
 			await this.backup.ensureDir(parentOf(dest));
 			await this.backup.dav("PUT", dest, data, { "Content-Type": "application/octet-stream" });
 		}
-		await this.mkdirs(parentOf(local));
-		await adapter.writeBinary(local, r.arrayBuffer, { mtime: e.m });
+		// A lock may have landed since the check above (the GET and the park take time): never a
+		// readable copy beside the hidden folder, let alone inside it.
+		if (isPrivate && (await adapter.exists(pf.hiddenName))) return "deferred";
+		try {
+			await this.mkdirs(parentOf(local));
+			await adapter.writeBinary(local, r.arrayBuffer, { mtime: e.m });
+		} catch (err) {
+			throw new RestoreFileError(`${sp}: cannot be written here: ${errMsg(err)}`);
+		}
 		const st2 = await adapter.stat(local);
 		this.backup.manifest[sp] = { m: st2?.mtime ?? e.m, s: st2?.size ?? e.s };
 		this.backup.touchManifest();
-		if (pf.isPrivateServerPath(sp)) this.wrotePrivate = true;
+		if (isPrivate) this.wrotePrivate = true;
 		return "written";
 	}
 
@@ -412,6 +452,16 @@ export class Control {
 
 function deferredNote(n: number): string {
 	return n ? `, ${n} private files deferred (locked): they are restored at the first backup run after the next unlock` : "";
+}
+
+/** One file of a restore that cannot be written: gone from the server, a server copy that is not
+ *  what the index says, a local copy that cannot be read or a name this disk refuses. */
+class RestoreFileError extends Error {}
+
+/** True when the trouble is with one file, not with the server or the login (the deferred run then goes on with the others). */
+function perFile(e: unknown): boolean {
+	if (e instanceof RestoreFileError) return true;
+	return e instanceof DavError && e.status >= 400 && e.status < 500 && e.status !== 401 && e.status !== 403;
 }
 
 /** Path parts the way Windows compares them: any case, trailing dots and spaces dropped. */

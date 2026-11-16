@@ -4,9 +4,11 @@
 // do their job; signed server bundles are verified, staged, started and refused as they
 // should be (with a key made here, never the real one). Since 1.9.0 also the encryption of
 // the private folder (cases 16-24c): the key from the server, the backup gate while locked,
-// the stray merge, a stop at every step of a file's transformation, the pair rule, the kill
-// switch, the lifeboat, the quit task, the deferred restore and one pass at a time. Plain
-// Node, no dependencies, about a minute (one case waits out the 30 s rename retry). Run
+// the stray merge, a stop at every step of a file's transformation, the read-back verify, the
+// pair rule, the kill switch, the lifeboat, the quit task, the deferred restore (also with a
+// lock landing mid-restore, a file gone from the server, a folder rename that keeps failing)
+// and one pass at a time. Plain Node, no dependencies, about 90 s (one case waits out the 30 s
+// rename retry, two wait for the 10 s hide retry). Run
 // after `npm run build` and `node scripts/build-tests.mjs` (npm test does both); exits
 // non-zero on the first failure.
 //
@@ -75,7 +77,7 @@ console.log = (...a) => {
 const hooks = { fs: null, adapter: null, folderRenamed: null, log: null };
 function resetHooks() {
 	hooks.fs = hooks.adapter = hooks.folderRenamed = hooks.log = null;
-	saveFail.data = saveFail.bak = 0;
+	saveFail.data = saveFail.bak = saveFail.delay = 0;
 }
 /** A path as the plugin gave it to fs, with "/" and without Windows' \\?\ prefix. */
 const norm = (p) => String(p).replace(/^\\\\\?\\/, "").split("\\").join("/");
@@ -122,8 +124,9 @@ function hookedFs(real, isAsync, promisesShim) {
 }
 const fsPromisesShim = hookedFs(fs.promises, true, null);
 const fsShim = hookedFs(fs, false, fsPromisesShim);
-/** saveData (data.json) / adapter.write of data.bak.json fail this many times while the settings hold a vault key. */
-const saveFail = { data: 0, bak: 0 };
+/** saveData (data.json) / adapter.write of data.bak.json fail this many times while the settings hold a vault key;
+ *  delay: the next saveData of a key takes this long first (a slow disk while the key arrives). */
+const saveFail = { data: 0, bak: 0, delay: 0 };
 
 // ---- DOM: just enough for the lock screens and the cover -------------------------------
 
@@ -250,6 +253,7 @@ class Plugin extends Component {
 		try { return JSON.parse(fs.readFileSync(path.join(this.app.vault.adapter.getBasePath(), PLUGIN_DIR, "data.json"), "utf8")); } catch { return null; }
 	}
 	async saveData(d) {
+		if (saveFail.delay > 0 && d?.vaultKey) { const ms = saveFail.delay; saveFail.delay = 0; await sleep(ms); }
 		if (saveFail.data > 0 && d?.vaultKey) { saveFail.data--; throw new Error("EACCES: data.json cannot be written (test)"); }
 		fs.writeFileSync(path.join(this.app.vault.adapter.getBasePath(), PLUGIN_DIR, "data.json"), JSON.stringify(d));
 	}
@@ -544,6 +548,9 @@ const ENC_LOCAL = { ...REAL_PASS, vaultKey: { id: KEY.id, key: KEY.key } };
 const ENC = { ...ENC_LOCAL, ...LOGIN };
 const H_DIR = ".Private";
 const V_DIR = "Private";
+/** "The pause was skipped" means well under ENC_PAUSE_MS (5 s): a pass that waited takes at least
+ *  that; the margin leaves a slow Windows runner (attrib.exe spawns, 250 ms retry steps) its room. */
+const PAUSE_BOUND = 4_900;
 const MAGIC = Buffer.from("VLENC1");
 const ASIDE_RE = /\.undecryptable-\d{4}-\d{2}-\d{2}_\d{6}(-\d+)?\.vlenc$/;
 
@@ -1617,7 +1624,7 @@ async function main() {
 		// requestEncrypt(): encrypted now, without the 5 s pause and without anyone calling finishLock().
 		await waitFor(() => { const d = disk(base); return d.vlenc === 1 && d.plain === 0 && d.tmp === 0; }, 10_000, "the hidden folder encrypted once the key arrived");
 		const took = Date.now() - keyAt;
-		check(keyAt > 0 && took < 4_000, `encrypted ${took} ms after the key was fetched: the pass waited for the pause`);
+		check(keyAt > 0 && took < PAUSE_BOUND, `encrypted ${took} ms after the key was fetched: the pass waited for the pause`);
 		await within(cur.finishLock(), 20_000, "finishLock");
 		encryptedOnDisk(base, ["Secret.md"], "after the key arrived (requestEncrypt)");
 		const d = await decryptFile(path.join(base, H_DIR, "Secret.md.vlenc"));
@@ -1714,22 +1721,26 @@ async function main() {
 	}
 
 	// 19. Strays made while locked (a link clicked) are moved into the private folder at the
-	// unlock, before the decrypt (C.9): beside the real note one gets "(created while locked)";
-	// nothing of them reaches the server while locked; Obsidian's delete events send nothing.
+	// unlock, before the decrypt (C.9): beside the real note one gets "(created while locked)",
+	// also when it differs from the real note only in case (NTFS and APFS would make it the same
+	// name, and the pair rule would then rename the real note); nothing of them reaches the
+	// server while locked; Obsidian's delete events send nothing.
 	step = "19 stray merge";
 	{
 		let idx;
 		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC, null, { before: (b) => {
+			fs.writeFileSync(path.join(b, V_DIR, "Memo.md"), "memo");
 			const s = fs.statSync(path.join(b, V_DIR, "Secret.md"));
 			idx = { "Private/Secret.md": { m: Math.floor(s.mtimeMs), s: s.size } };
 		} });
 		const cur = S.current;
 		await within(cur.finishLock(), 20_000, "finishLock");
-		encryptedOnDisk(base, ["Secret.md"], "locked");
+		encryptedOnDisk(base, ["Secret.md", "Memo.md"], "locked");
 		server = fakeServer({ "_manifest.json": JSON.stringify(idx), "Private/Secret.md": "secret" });
 		fs.mkdirSync(path.join(base, V_DIR));
 		fs.writeFileSync(path.join(base, V_DIR, "Secret.md"), "");
 		fs.writeFileSync(path.join(base, V_DIR, "Other.md"), "other");
+		fs.writeFileSync(path.join(base, V_DIR, "memo.md"), "a stray, made while locked"); // the real note's name in another case
 		const ev = events(cur);
 		// Obsidian sees each stray go when the merge moves it into the dot folder (as a delete, or
 		// as a rename to the hidden name: neither may send anything), and the emptied folder go.
@@ -1744,16 +1755,20 @@ async function main() {
 		cur.backup.onPaired(false);
 		ev.create("Private/Secret.md");
 		ev.create("Private/Other.md");
+		ev.create("Private/memo.md");
 		await within(cur.backup.queue, 15_000, "reconcile");
 		await sleep(2_300);
 		await within(cur.backup.queue, 15_000, "the strays' change events");
 		check(privateWrites(server).length === 0, "something under Private/ was sent while locked: " + privateWrites(server));
 		await unlockApp(cur);
-		check(strayMoves === 2, `${strayMoves} stray(s) moved with adapter.rename (C.9), want 2`);
+		check(strayMoves === 3, `${strayMoves} stray(s) moved with adapter.rename (C.9), want 3`);
 		const V = path.join(base, V_DIR);
 		check(fs.readFileSync(path.join(V, "Secret.md"), "utf8") === "secret", "the real note was not decrypted intact: " + listFiles(V));
 		check(fs.existsSync(path.join(V, "Secret (created while locked).md")) && fs.readFileSync(path.join(V, "Secret (created while locked).md"), "utf8") === "", "the stray beside the real note was not kept as 'Secret (created while locked).md': " + listFiles(V));
 		check(fs.readFileSync(path.join(V, "Other.md"), "utf8") === "other", "the other stray is not back: " + listFiles(V));
+		// The case-variant stray: the real note keeps its name and text, the stray gets the suffix (on every disk).
+		check(listFiles(V).includes("Memo.md") && fs.readFileSync(path.join(V, "Memo.md"), "utf8") === "memo" && !listFiles(V).some((r) => /^Memo \(recovered/.test(r)), "the stray 'memo.md' took the real note's name: " + listFiles(V));
+		check(fs.existsSync(path.join(V, "memo (created while locked).md")) && fs.readFileSync(path.join(V, "memo (created while locked).md"), "utf8") === "a stray, made while locked", "the stray 'memo.md' was not kept as 'memo (created while locked).md': " + listFiles(V));
 		check(!fs.existsSync(path.join(base, H_DIR)) && !listFiles(V).some((r) => r.includes(".vlenc")), "left after the unlock: " + listFiles(V));
 		await within(cur.backup.queue, 15_000, "reconcile after the unlock");
 		await sleep(50);
@@ -1842,32 +1857,134 @@ async function main() {
 		}
 	}
 
+	// 20b. The read-back verify of both directions (B1 E2, B2 D2) with a temp file that reads back
+	// wrong: the readable copy is never deleted on the strength of what was meant to be written.
+	step = "20b verify read-back (encrypt E2)";
+	{
+		const { p, S, base, app } = await startPlugin(VaultLockPlugin, ENC_LOCAL);
+		const cur = S.current;
+		const m = (await app.vault.adapter.stat(H_DIR + "/Secret.md")).mtime;
+		const forged = await vlencEncrypt(KEY, "not what was typed", m); // decrypts fine, other plaintext
+		let hit = 0;
+		hooks.fs = (name, a, isAsync) => {
+			const f = typeof a[0] === "string" ? norm(a[0]) : "";
+			if (isAsync && name === "readFile" && f.endsWith("/Secret.md.vlenc.tmp") && !hit) { hit++; fs.writeFileSync(f, forged); }
+			return 0;
+		};
+		await within(cur.finishLock(), 20_000, "finishLock");
+		resetHooks();
+		check(hit === 1, "the E2 read-back was not seen");
+		check(fs.existsSync(path.join(base, H_DIR, "Secret.md")) && fs.readFileSync(path.join(base, H_DIR, "Secret.md"), "utf8") === "secret", "E2: the plaintext was deleted although the read-back differs: " + dstr(disk(base)));
+		check(cur.privateFolder.stats().failed.some((f) => f.includes("Secret.md") && /verify/.test(f)), "E2: the failed verify is not reported: " + JSON.stringify(cur.privateFolder.stats().failed));
+		await unlockApp(cur);
+		check(fs.readFileSync(path.join(base, V_DIR, "Secret.md"), "utf8") === "secret" && !listFiles(path.join(base, V_DIR)).some((r) => r.includes(".vlenc")), "E2: the note changed, or a temp file was left: " + listFiles(path.join(base, V_DIR)));
+		await stopPlugin(p);
+	}
+	step = "20b verify read-back (decrypt D2)";
+	{
+		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC_LOCAL);
+		const cur = S.current;
+		await within(cur.finishLock(), 20_000, "finishLock");
+		encryptedOnDisk(base, ["Secret.md"], "locked");
+		const enc = fs.readFileSync(path.join(base, H_DIR, "Secret.md.vlenc"));
+		let hit = 0;
+		hooks.fs = (name, a, isAsync) => {
+			const f = typeof a[0] === "string" ? norm(a[0]) : "";
+			if (isAsync && name === "readFile" && f.endsWith("/Secret.md.vlenc.tmp") && !hit) { hit++; fs.writeFileSync(f, "a disk that lost the write"); }
+			return 0;
+		};
+		check(await within(cur.lockScreen.tryUnlock("right"), 60_000, "unlock") === true, "the right passphrase was refused");
+		resetHooks();
+		check(hit === 1, "the D2 read-back was not seen");
+		const V = path.join(base, V_DIR);
+		check(!cur.locked() && fs.existsSync(V), "the unlock with one failed file did not open the folder: " + errText());
+		check(hasMagic(path.join(V, "Secret.md.vlenc")) && fs.readFileSync(path.join(V, "Secret.md.vlenc")).equals(enc), "D2: the .vlenc was deleted or changed although the decrypted copy read back wrong: " + listFiles(V));
+		check(!fs.existsSync(path.join(V, "Secret.md")) || fs.readFileSync(path.join(V, "Secret.md"), "utf8") === "secret", "D2: a wrong decrypted copy was put in place: " + listFiles(V));
+		check(cur.privateFolder.stats().failed.some((f) => f.includes("Secret.md") && /verify/.test(f)), "D2: the failed verify is not reported: " + JSON.stringify(cur.privateFolder.stats().failed));
+		// The next lock and unlock bring the note back.
+		await within(cur.lock(), 10_000, "lock");
+		await within(cur.finishLock(), 20_000, "finishLock");
+		await unlockApp(cur, "the next unlock");
+		check(fs.readFileSync(path.join(V, "Secret.md"), "utf8") === "secret" && !fs.existsSync(path.join(V, "Secret.md.vlenc")), "the note did not come back at the next unlock: " + listFiles(V));
+		await stopPlugin(p);
+	}
+
 	// 21. Pair rule, asides and names (C.5, B4, B14): nothing readable is ever replaced or deleted.
 	step = "21 pair rule, asides, names";
 	{
 		const T = Date.parse("2026-11-01T09:00:00Z");
 		const report = crypto.randomBytes(1024), userVlenc = crypto.randomBytes(5 * 1024), orphan = crypto.randomBytes(100);
+		const report2 = crypto.randomBytes(5 * 1024), userVlenc2 = crypto.randomBytes(1024); // the same pair with the sizes the other way round
 		const encA = await vlencEncrypt(KEY, "alpha", T);
 		const encB = await vlencEncrypt(KEY, "bravo, the older text", T);
+		const encC = await vlencEncrypt(KEY, "charlie, the older text", T);
+		const encQ = await vlencEncrypt(KEY, "quebec", T);
 		const encW = await vlencEncrypt(KEY2, "whiskey", T); // another computer's key (G.3)
 		const encY = await vlencEncrypt(KEY2, "yankee, under the old key", T);
+		// A name whose "(recovered …)" sibling would be over 255 bytes (its own .vlenc.tmp is not). The
+		// test's own fs calls use plain paths, so this one stays off the Windows runners (MAX_PATH).
+		const LONG = process.platform === "win32" ? null : "n".repeat(230);
+		const encL = await vlencEncrypt(KEY, "long, the older text", T);
 		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC_LOCAL, null, { before: (b) => {
 			// Locked by an earlier run: .Private/ on disk with leftovers of every kind.
 			fs.renameSync(path.join(b, V_DIR), path.join(b, H_DIR));
 			const w = (rel, data) => fs.writeFileSync(path.join(b, H_DIR, rel), data);
-			w("A.md", "alpha"); w("A.md.vlenc", encA); // x + x.vlenc, the same
-			w("B.md", "bravo, the newer text"); w("B.md.vlenc", encB); // x + x.vlenc, different
+			w("A.md", "alpha"); w("A.md.vlenc", encA); // x + x.vlenc, the same (and its unlink refuses once)
+			w("B.md", "bravo, the newer text"); w("B.md.vlenc", encB); // x + x.vlenc, different (and its sibling's rename fails once)
+			w("C.md", "charlie, the newer text"); w("C.md.vlenc", encC); // different; the sibling's rename says ENOENT (Windows' word for a name too long)
 			w("Y.md", "yankee"); w("Y.md.vlenc", encY); // x + x.vlenc of another key: the pair rule's aside (C.5)
 			w("W.md.vlenc", encW); // alone: moved aside at the unlock (C.4 D0)
 			w("Orphan.md.vlenc.tmp", orphan); // a temp file without its source
 			w("foo.vlenc", "not ours, only the name"); // a plain file named *.vlenc
 			w("report.md", report); w("report.md.vlenc", userVlenc); // our name taken by the user's file
+			w("report2.md", report2); w("report2.md.vlenc", userVlenc2); // the user's file is the smaller one
+			w("Z.md", "zulu"); // a plain Z.md.vlenc appears while Z.md is being encrypted (E3)
+			w("E4.md", "echo"); // rewritten by another program while being encrypted (E4)
+			w("Q.md.vlenc", encQ); // a plain Q.md appears while it is being decrypted (D4)
+			if (LONG) { w(LONG + ".md", "long, the newer text"); w(LONG + ".md.vlenc", encL); }
 		} });
 		const cur = S.current, pf = cur.privateFolder;
 		const H = path.join(base, H_DIR);
+		const once = {};
+		const errno = (code) => Object.assign(new Error(`${code}: refused (test)`), { code });
+		hooks.fs = (name, a, isAsync) => {
+			if (!isAsync) return 0;
+			const f = typeof a[0] === "string" ? norm(a[0]) : "", to = typeof a[1] === "string" ? norm(a[1]) : "";
+			// E3: the target name is taken between E2 and E3 (a plain file, no magic).
+			if (name === "readFile" && f.endsWith("/Z.md.vlenc.tmp") && !once.Z) { once.Z = 1; fs.writeFileSync(path.join(H, "Z.md.vlenc"), "squatter"); }
+			// E4: x is rewritten by another program right before its .vlenc lands.
+			if (name === "rename" && f.endsWith("/E4.md.vlenc.tmp") && !once.E4) { once.E4 = 1; fs.appendFileSync(path.join(H, "E4.md"), " edited"); }
+			// C.5: the sibling's rename fails once: a disk error for B, Windows' ENOENT for a long name for C.
+			if (name === "rename" && /\/B \(recovered [^/]*\)\.md$/.test(to) && !once.B) { once.B = 1; throw errno("EIO"); }
+			if (name === "rename" && /\/C \(recovered [^/]*\)\.md$/.test(to) && !once.C) { once.C = 1; throw errno("ENOENT"); }
+			// E4's unlink refuses once (a handle Defender holds): fsRetry.
+			if (name === "unlink" && f.endsWith("/A.md") && !once.A) { once.A = 1; throw errno("EBUSY"); }
+			// D4: a plain Q.md appears while Q.md.vlenc is decrypted (between D3 and D4).
+			if (name === "utimes" && f.endsWith("/Q.md.vlenc.tmp") && !once.Q) { once.Q = 1; fs.writeFileSync(path.join(H, "Q.md"), "squatter"); }
+			return 0;
+		};
 		await within(cur.finishLock(), 20_000, "finishLock");
 		const dec = async (rel) => (await decryptFile(path.join(H, rel))).plain;
 		const names = () => listFiles(H).join(", ");
+		const failed = () => pf.stats().failed;
+		check(once.Z && once.E4 && once.B && once.C && once.A, "not every hook fired in the first pass: " + JSON.stringify(once));
+		// A sibling that could not be made: both files stay, no temp file with readable text, reported.
+		check(fs.existsSync(path.join(H, "B.md")) && fs.readFileSync(path.join(H, "B.md"), "utf8") === "bravo, the newer text" && fs.existsSync(path.join(H, "B.md.vlenc")) && !listFiles(H).some((r) => /^B\b.*\.vlenc\.tmp$/.test(r) || /^B \(recovered/.test(r)), "after the failed sibling: B.md and B.md.vlenc and nothing else of B expected: " + names());
+		check(failed().some((f) => f.startsWith(".Private/B.md:") && /EIO/.test(f)), "the failed sibling is not reported: " + JSON.stringify(failed()));
+		// The sibling whose long name the disk refused got a short one.
+		check(!fs.existsSync(path.join(H, "C.md")) && (await dec("C.md.vlenc")).toString() === "charlie, the newer text" && !listFiles(H).some((r) => /^C \(recovered/.test(r)), "C: not encrypted under its own name, or the sibling kept the refused name: " + names());
+		// E4: the rewritten plaintext stays beside the .vlenc of the first text, reported.
+		check(fs.existsSync(path.join(H, "E4.md")) && fs.readFileSync(path.join(H, "E4.md"), "utf8") === "echo edited" && (await dec("E4.md.vlenc")).toString() === "echo", "E4: the rewritten plaintext was deleted, or the .vlenc is not the first text: " + names());
+		check(failed().some((f) => f.startsWith(".Private/E4.md:") && /changed while being encrypted/.test(f)), "E4 not reported: " + JSON.stringify(failed()));
+		// E3: the squatter keeps the name untouched; Z.md stays plaintext, reported.
+		const h = (rel) => (fs.existsSync(path.join(H, rel)) ? fs.readFileSync(path.join(H, rel), "utf8") : null);
+		check(h("Z.md") === "zulu" && h("Z.md.vlenc") === "squatter" && !fs.existsSync(path.join(H, "Z.md.vlenc.vlenc")), "E3: the squatter at Z.md.vlenc was replaced, or Z.md is gone: " + names());
+		check(failed().some((f) => f.startsWith(".Private/Z.md:") && /taken/.test(f)), "E3 not reported: " + JSON.stringify(failed()));
+		check(!failed().some((f) => f.startsWith(".Private/A.md")), "an unlink that refused once is a failure: " + JSON.stringify(failed()));
+		check(pf.stats().undecryptable === 1, "undecryptable after the lock: " + pf.stats().undecryptable);
+		// The busy retry (fired by hand): the pairs that failed settle, nothing is lost.
+		pf.__fireRetry();
+		await within(cur.finishLock(), 20_000, "finishLock (the retry)");
 		check(!fs.existsSync(path.join(H, "Secret.md")) && (await dec("Secret.md.vlenc")).toString() === "secret", "Secret.md not encrypted: " + names());
 		check(!fs.existsSync(path.join(H, "A.md")) && (await dec("A.md.vlenc")).toString() === "alpha" && !listFiles(H).some((r) => r.startsWith("A (")), "identical pair: " + names());
 		check(!fs.existsSync(path.join(H, "B.md")) && (await dec("B.md.vlenc")).toString() === "bravo, the newer text", "different pair: the newer note is not the one encrypted: " + names());
@@ -1875,24 +1992,40 @@ async function main() {
 		check(recB.length === 1, "different pair: no single 'B (recovered …).md': " + names());
 		const recBytes = recB[0].endsWith(".vlenc") ? await dec(recB[0]) : fs.readFileSync(path.join(H, recB[0]));
 		check(recBytes.toString() === "bravo, the older text", "the recovered sibling does not hold the older text");
+		const recShort = listFiles(H).filter((r) => /^recovered \d{4}-\d{2}-\d{2}_\d{6}(-\d+)?\.md\.vlenc$/.test(r));
+		const shortTexts = (await Promise.all(recShort.map(dec))).map(String).sort();
+		check(JSON.stringify(shortTexts) === JSON.stringify(["charlie, the older text"].concat(LONG ? ["long, the older text"] : []).sort()), "the short-named siblings hold: " + JSON.stringify(shortTexts) + " in " + names());
+		if (LONG) check(!fs.existsSync(path.join(H, LONG + ".md")) && (await dec(LONG + ".md.vlenc")).toString() === "long, the newer text", "the long-named pair did not settle: " + JSON.stringify(failed()));
+		check(!fs.existsSync(path.join(H, "E4.md")) && (await dec("E4.md.vlenc")).toString() === "echo edited", "E4 after the retry: the edit is not the one under its own name: " + names());
+		const recE = listFiles(H).filter((r) => /^E4 \(recovered [^)]+\)\.md\.vlenc$/.test(r));
+		check(recE.length === 1 && (await dec(recE[0])).toString() === "echo", "E4 after the retry: the first text is not a sibling: " + names());
+		check(!fs.existsSync(path.join(H, "Z.md")) && (await dec("Z.md.vlenc")).toString() === "zulu" && (await dec("Z.md.vlenc.vlenc")).toString() === "squatter", "Z after the retry (B14: the squatter becomes Z.md.vlenc.vlenc, Z.md takes its name): " + names());
 		check(sha1(fs.readFileSync(path.join(H, "W.md.vlenc"))) === sha1(encW), "a .vlenc of another key was changed at the lock");
 		const asideY = listFiles(H).filter((r) => /^Y\.md\.undecryptable-\d{4}-\d{2}-\d{2}_\d{6}(-\d+)?\.vlenc$/.test(r));
 		check(asideY.length === 1 && sha1(fs.readFileSync(path.join(H, asideY[0]))) === sha1(encY), "pair with another key's .vlenc: not moved aside unchanged: " + names());
 		check(!fs.existsSync(path.join(H, "Y.md")) && (await dec("Y.md.vlenc")).toString() === "yankee" && !listFiles(H).some((r) => r.startsWith("Y (")), "pair with another key's .vlenc: Y.md not encrypted under its own name: " + names());
-		check(pf.stats().undecryptable === 1, "undecryptable after the lock: " + pf.stats().undecryptable);
 		check(fs.existsSync(path.join(H, "Orphan.md.vlenc.tmp")) && sha1(fs.readFileSync(path.join(H, "Orphan.md.vlenc.tmp"))) === sha1(orphan), "the orphan temp file was not kept as it was");
-		check(pf.stats().failed.some((f) => f.includes("Orphan.md") && /orphan/i.test(f)), "the orphan temp file is not reported: " + JSON.stringify(pf.stats().failed));
+		check(failed().some((f) => f.includes("Orphan.md") && /orphan/i.test(f)), "the orphan temp file is not reported: " + JSON.stringify(failed()));
 		check(!fs.existsSync(path.join(H, "foo.vlenc")) && (await dec("foo.vlenc.vlenc")).toString() === "not ours, only the name", "a plain *.vlenc was not encrypted to *.vlenc.vlenc: " + names());
 		check(!fs.existsSync(path.join(H, "report.md")) && (await dec("report.md.vlenc")).equals(report), "report.md is not encrypted under its own name (defer rule): " + names());
 		check((await dec("report.md.vlenc.vlenc")).equals(userVlenc), "the user's report.md.vlenc was not encrypted to report.md.vlenc.vlenc: " + names());
+		check(!fs.existsSync(path.join(H, "report2.md")) && (await dec("report2.md.vlenc")).equals(report2) && (await dec("report2.md.vlenc.vlenc")).equals(userVlenc2), "report2 (the user's file smaller): " + names());
 		check(disk(base).tmp === 1, "temp files left besides the orphan: " + names());
 		await unlockApp(cur);
+		check(once.Q, "the D4 hook did not fire");
 		const V = path.join(base, V_DIR);
 		const txt = (rel) => fs.readFileSync(path.join(V, rel), "utf8");
-		check(txt("Secret.md") === "secret" && txt("A.md") === "alpha" && txt("B.md") === "bravo, the newer text" && txt("Y.md") === "yankee", "notes after the unlock: " + listFiles(V));
+		check(txt("Secret.md") === "secret" && txt("A.md") === "alpha" && txt("B.md") === "bravo, the newer text" && txt("Y.md") === "yankee" && txt("C.md") === "charlie, the newer text", "notes after the unlock: " + listFiles(V));
 		check(fs.existsSync(path.join(V, asideY[0])) && sha1(fs.readFileSync(path.join(V, asideY[0]))) === sha1(encY), "the aside made at the lock is gone or changed after the unlock: " + listFiles(V));
 		const recV = listFiles(V).filter((r) => /^B \(recovered [^)]+\)\.md$/.test(r));
 		check(recV.length === 1 && txt(recV[0]) === "bravo, the older text", "the recovered sibling is not there after the unlock: " + listFiles(V));
+		const shortV = listFiles(V).filter((r) => /^recovered \d{4}-\d{2}-\d{2}_\d{6}(-\d+)?\.md$/.test(r)).map(txt).sort();
+		check(JSON.stringify(shortV) === JSON.stringify(shortTexts), "the short-named siblings after the unlock: " + JSON.stringify(shortV));
+		if (LONG) check(txt(LONG + ".md") === "long, the newer text", "the long-named note after the unlock");
+		check(txt("E4.md") === "echo edited" && listFiles(V).some((r) => /^E4 \(recovered [^)]+\)\.md$/.test(r) && txt(r) === "echo"), "E4 after the unlock: " + listFiles(V));
+		check(txt("Z.md") === "zulu" && txt("Z.md.vlenc") === "squatter" && !fs.existsSync(path.join(V, "Z.md.vlenc.vlenc")), "Z after the unlock: " + listFiles(V));
+		// D4: the squatter keeps the name; the decrypted text is a sibling; the .vlenc went only once that sibling was in place.
+		check(txt("Q.md") === "squatter" && listFiles(V).some((r) => /^Q \(recovered [^)]+\)\.md$/.test(r) && txt(r) === "quebec") && !fs.existsSync(path.join(V, "Q.md.vlenc")), "Q after the unlock (D4): " + listFiles(V));
 		const asides = listFiles(V).filter((r) => /^W\.md\.undecryptable-\d{4}-\d{2}-\d{2}_\d{6}(-\d+)?\.vlenc$/.test(r));
 		check(asides.length === 1 && sha1(fs.readFileSync(path.join(V, asides[0]))) === sha1(encW), "the undecryptable file was not moved aside unchanged: " + listFiles(V));
 		check(!fs.existsSync(path.join(V, "W.md")) && !fs.existsSync(path.join(V, "W.md.vlenc")), "W.md: " + listFiles(V));
@@ -1900,7 +2033,9 @@ async function main() {
 		check(sha1(fs.readFileSync(path.join(V, "Orphan.md.vlenc.tmp"))) === sha1(orphan), "the orphan temp file is gone or changed after the unlock");
 		check(fs.readFileSync(path.join(V, "foo.vlenc"), "utf8") === "not ours, only the name" && !fs.existsSync(path.join(V, "foo.vlenc.vlenc")), "foo.vlenc after the unlock: " + listFiles(V));
 		check(fs.readFileSync(path.join(V, "report.md")).equals(report) && fs.readFileSync(path.join(V, "report.md.vlenc")).equals(userVlenc) && !fs.existsSync(path.join(V, "report.md.vlenc.vlenc")), "report.md / the user's report.md.vlenc after the unlock: " + listFiles(V));
+		check(fs.readFileSync(path.join(V, "report2.md")).equals(report2) && fs.readFileSync(path.join(V, "report2.md.vlenc")).equals(userVlenc2) && !fs.existsSync(path.join(V, "report2.md.vlenc.vlenc")), "report2.md / the user's report2.md.vlenc after the unlock: " + listFiles(V));
 		check(!listFiles(V).some((r) => !ASIDE_RE.test(r) && hasMagic(path.join(V, r))), "encrypted files left after the unlock: " + listFiles(V));
+		resetHooks();
 		await stopPlugin(p);
 	}
 	step = "21b aside + stray; a leftover .vlenc beside a visible note";
@@ -1942,6 +2077,31 @@ async function main() {
 		check(failed.some((f) => f.startsWith("Private/Left.md")), "not listed in failed: " + JSON.stringify(failed));
 		await stopPlugin(p);
 		server = null;
+	}
+	// A .vlenc the walk cannot open (held by another program) is a per-file failure, not a plain
+	// file: it is neither encrypted a second time at the lock nor skipped at the unlock.
+	step = "21c a .vlenc that cannot be opened";
+	{
+		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC_LOCAL);
+		const cur = S.current, pf = cur.privateFolder;
+		await within(cur.finishLock(), 20_000, "finishLock");
+		encryptedOnDisk(base, ["Secret.md"], "locked");
+		const before = fs.readFileSync(path.join(base, H_DIR, "Secret.md.vlenc"));
+		let hit = 0;
+		hooks.fs = (name, a, isAsync) => {
+			if (isAsync && name === "open" && typeof a[0] === "string" && norm(a[0]).endsWith("/Secret.md.vlenc") && a[1] === "r" && !hit) { hit++; throw Object.assign(new Error("EBUSY: resource busy (test)"), { code: "EBUSY" }); }
+			return 0;
+		};
+		pf.requestEncrypt();
+		await within(cur.finishLock(), 20_000, "finishLock");
+		resetHooks();
+		check(hit === 1, "the walk did not open Secret.md.vlenc");
+		const H = path.join(base, H_DIR);
+		check(!fs.existsSync(path.join(H, "Secret.md.vlenc.vlenc")) && fs.readFileSync(path.join(H, "Secret.md.vlenc")).equals(before) && disk(base).tmp === 0, "a .vlenc that could not be opened was taken for a plain file: " + dstr(disk(base)));
+		check(pf.stats().failed.some((f) => f.includes("Secret.md.vlenc") && /EBUSY/.test(f)), "the file that could not be opened is not reported: " + JSON.stringify(pf.stats().failed));
+		await unlockApp(cur);
+		check(fs.readFileSync(path.join(base, V_DIR, "Secret.md"), "utf8") === "secret" && !listFiles(path.join(base, V_DIR)).some((r) => r.includes(".vlenc")), "after the unlock: " + listFiles(path.join(base, V_DIR)));
+		await stopPlugin(p);
 	}
 
 	// 22. Limits and switches: over 100 MB, no key, the kill switch, a different key on the
@@ -2000,9 +2160,33 @@ async function main() {
 		check(p.settings.encrypt === true, "encrypt:true was not applied");
 		// Encrypted now (requestEncrypt), not at the next lock and not after a pause.
 		await waitFor(() => { const x = disk(base); return x.vlenc === 1 && x.plain === 0 && x.tmp === 0; }, 10_000, "the hidden folder encrypted once encrypt was on again");
-		check(cfgAt > 0 && Date.now() - cfgAt < 4_000, `encrypted ${Date.now() - cfgAt} ms after encrypt:true was read: the pass waited for the pause`);
+		check(cfgAt > 0 && Date.now() - cfgAt < PAUSE_BOUND, `encrypted ${Date.now() - cfgAt} ms after encrypt:true was read: the pass waited for the pause`);
 		await within(cur.finishLock(), 20_000, "finishLock");
 		encryptedOnDisk(base, ["Secret.md"], "encrypt on again while hidden (requestEncrypt)");
+
+		// The core's tick reads config.json too and writes the same setting: when it gets there
+		// first, the app's own compare sees no change. The hidden folder is still encrypted now.
+		step = "22 kill switch: the core tick applies encrypt:true first";
+		server.files.set("_control/config.json", Buffer.from(JSON.stringify({ encrypt: false })));
+		await reconcile(cur);
+		check(p.settings.encrypt === false, "encrypt:false was not applied the second time");
+		await unlockApp(cur, "unlock with encrypt off again");
+		await within(cur.backup.queue, 15_000, "reconcile after the unlock");
+		await within(cur.lock(), 10_000, "lock");
+		await within(cur.finishLock(), 20_000, "finishLock");
+		d = disk(base);
+		check(d.plain === 1 && d.vlenc === 0, "encrypt off: the lock did more than hide: " + dstr(d));
+		server.files.set("_control/config.json", Buffer.from(JSON.stringify({ encrypt: true })));
+		await within(S.tick(), 5_000, "core tick");
+		check(p.settings.encrypt === true && readData(base).encrypt === true, "the core tick did not apply and save encrypt:true");
+		cfgAt = 0;
+		server.hold = (m, f) => { if (m === "GET" && f === "_control/config.json" && !cfgAt) cfgAt = Date.now(); return null; };
+		await reconcile(cur);
+		server.hold = () => null;
+		await waitFor(() => { const x = disk(base); return x.vlenc === 1 && x.plain === 0 && x.tmp === 0; }, 10_000, "the hidden folder encrypted by the reconcile after the core tick turned encryption on");
+		check(cfgAt > 0 && Date.now() - cfgAt < PAUSE_BOUND, `encrypted ${Date.now() - cfgAt} ms after the reconcile read the config: the pass waited for the pause`);
+		await within(cur.finishLock(), 20_000, "finishLock");
+		encryptedOnDisk(base, ["Secret.md"], "encrypt on again (core tick first)");
 
 		step = "22 a different key on the server";
 		server.files.set(KEY_FILE, Buffer.from(keyJson(KEY2)));
@@ -2044,6 +2228,27 @@ async function main() {
 		check(!server.sent("GET", "_control/update/app/app.js") && !server.sent("GET", "_control/update/core/main.js"), "old plugin code was downloaded");
 		cs = S.coreStatus();
 		check(S.running?.id === BUILTIN && cs.server?.state === "rejected", "after the tick: " + JSON.stringify({ running: S.running, server: cs.server }));
+		await stopPlugin(p);
+		server = null;
+	}
+	// B9: a key that is in memory but not yet on disk (its strict save still running when the
+	// lock's pause ends) encrypts nothing; when the save then fails, the key is dropped.
+	step = "22 the key arrives while the pause runs and its save is slow and fails";
+	{
+		const { p, S, base } = await startPlugin(VaultLockPlugin, { ...REAL_PASS, ...LOGIN });
+		const cur = S.current, pf = cur.privateFolder;
+		server = fakeServer({ [KEY_FILE]: keyJson() });
+		saveFail.delay = 6_500; // longer than ENC_PAUSE_MS
+		saveFail.data = 1;
+		cur.backup.onPaired(false);
+		await waitFor(() => !!p.settings.vaultKey, 10_000, "the key in memory");
+		check(pf.keyDurable === false && !pf.encryptionReady(), "a key not yet on disk counts as ready");
+		await within(cur.backup.queue, 20_000, "reconcile");
+		check(saveFail.data === 0 && cur.backup.control.keyState === "unsaved" && p.settings.vaultKey === null, `after the slow failed save: keyState ${cur.backup.control.keyState}, vaultKey ${JSON.stringify(p.settings.vaultKey)}`);
+		await within(cur.finishLock(), 20_000, "finishLock");
+		const d = disk(base);
+		check(pf.__passes >= 1 && d.plain === 1 && d.vlenc === 0 && d.tmp === 0, "encrypted with a key that was never saved: " + dstr(d));
+		resetHooks();
 		await stopPlugin(p);
 		server = null;
 	}
@@ -2143,16 +2348,82 @@ async function main() {
 		check(S.running?.kind === "lifeboat" && lb.locked(), "not the locked lifeboat");
 		await within(lb.finishLock(), 20_000, "finishLock");
 		encryptedOnDisk(base, ["Secret.md"], "the lifeboat's lock");
+		// A stray made while locked (a link clicked) beside .Private/: never uploaded (B5).
+		fs.mkdirSync(path.join(base, V_DIR));
+		fs.writeFileSync(path.join(base, V_DIR, "Secret.md"), "");
 		await within(lb.run(), 10_000, "lifeboat run");
 		check(!server.log.some((l) => l.includes("Private")) && ![...server.files.keys()].some((k) => k.includes(".vlenc")), "the lifeboat sent something of the private folder while hidden: " + server.log.filter((l) => l.includes("Private") || l.includes(".vlenc")));
+		check(server.files.has("Note.md"), "the lifeboat did not back up the public note");
 		const st = server.json("_control/status.json");
 		const enc = st.encryption;
 		check(st.lifeboat === true && enc && enc.on === true && enc.keyId === KEY.id && enc.keyState === "ok" && enc.files === 1 && enc.plain === 0 && Array.isArray(enc.restoreDeferred), "lifeboat status.json: " + JSON.stringify({ lifeboat: st.lifeboat, encryption: enc }));
+		fs.rmSync(path.join(base, V_DIR), { recursive: true });
+		// A lock() while the passphrase is still being checked wins: nothing is decrypted (B15).
+		step = "23 lifeboat: lock() while the passphrase is checked";
+		{
+			const unlocking = lb.tryUnlock("right");
+			const locking = lb.lock();
+			check(await within(unlocking, 20_000, "the unlock") === true, "the right passphrase was answered as wrong");
+			await within(locking, 10_000, "lock()");
+			const d = disk(base);
+			check(lb.locked() && lockUp() && fs.existsSync(path.join(base, H_DIR)) && !fs.existsSync(path.join(base, V_DIR)) && d.vlenc === 1 && d.plain === 0, "a lock() during the passphrase check did not win: locked " + lb.locked() + ", " + dstr(d));
+		}
 		await unlockApp(lb, "lifeboat unlock");
 		check(!fs.existsSync(path.join(base, H_DIR)), "the hidden folder is still there after the lifeboat's unlock");
 		sameSnap(snap(path.join(base, V_DIR)), orig, "after the lifeboat's unlock");
+		// The folder rename at the lock fails for longer than its retry (a file held open): the
+		// lifeboat tries again every HIDE_RETRY_MS, like the lock screen, until it is hidden.
+		step = "23 lifeboat: a lock whose folder rename keeps failing for a while";
+		{
+			const until = performance.now() + 3_600; // longer than RENAME_RETRY_MS, shorter than HIDE_RETRY_MS
+			const eperm = () => Object.assign(new Error("EPERM: operation not permitted, rename (test: held by another program)"), { code: "EPERM" });
+			hooks.adapter = (name, a) => { if (name === "rename" && folderRename(a[0], a[1]) === "hide" && performance.now() < until) throw eperm(); return 0; };
+			const t0 = Date.now();
+			await within(lb.lock(), 10_000, "lifeboat lock");
+			check(lb.locked() && lockUp() && fs.existsSync(path.join(base, V_DIR)) && !fs.existsSync(path.join(base, H_DIR)), "the test's failing rename did not fail");
+			check(lb.pf.stats().hideError, "hideError not set after the failed rename");
+			await waitFor(() => fs.existsSync(path.join(base, H_DIR)) && !fs.existsSync(path.join(base, V_DIR)), 16_000, "the lifeboat's hide retry");
+			console.log(`[smoke] the lifeboat hid the folder ${((Date.now() - t0) / 1000).toFixed(1)} s after the lock whose rename failed`);
+			resetHooks();
+			await within(lb.finishLock(), 20_000, "finishLock");
+			encryptedOnDisk(base, ["Secret.md"], "after the lifeboat's hide retry");
+			check(lb.pf.stats().hideError === null, "hideError still set after the retry hid the folder");
+			await unlockApp(lb, "lifeboat unlock after the retry");
+			sameSnap(snap(path.join(base, V_DIR)), orig, "after the lifeboat's second unlock");
+		}
 		await within(lb.run(), 10_000, "lifeboat run");
 		check(server.files.get("Private/Secret.md")?.toString() === "secret" && ![...server.files.keys()].some((k) => k.includes(".vlenc")), "the lifeboat did not back up the private note once unlocked");
+		// Unlocked, a note with an encrypted copy beside it: never uploaded, reported (B5).
+		fs.writeFileSync(path.join(base, V_DIR, "Left.md"), "left");
+		fs.writeFileSync(path.join(base, V_DIR, "Left.md.vlenc"), await vlencEncrypt(KEY, "left", Date.now()));
+		await within(lb.run(), 10_000, "lifeboat run");
+		check(!server.sent("PUT", "Private/Left.md") && !server.sent("PUT", "Private/Left.md.vlenc"), "the lifeboat uploaded a note with an encrypted copy beside it");
+		const lf = server.json("_control/status.json").lastReconcile?.failed ?? [];
+		check(lf.some((f) => f.startsWith("Private/Left.md")), "not listed in the lifeboat's failed: " + JSON.stringify(lf));
+		await stopPlugin(p);
+		server = null;
+	}
+	// 23b. A restore still owes private files (restoreDeferred) and the lifeboat runs unlocked:
+	// nothing under Private/ is uploaded (B6/B8: the gate has no exceptions in the lifeboat), so
+	// an older local note never lands on the newer server copy the deferred restore brings back.
+	step = "23b lifeboat with a deferred restore pending";
+	{
+		const T0 = Date.parse("2026-11-10T08:00:00Z");
+		const { p, S, base } = await startPlugin(VaultLockPlugin, { ...ENC, restoreDeferred: [{ id: "move-1", cmd: "restore-all" }] }, { v: 1, config: { safeMode: true } }, { before: (b) => {
+			fs.writeFileSync(path.join(b, V_DIR, "Secret.md"), "old local text");
+			fs.utimesSync(path.join(b, V_DIR, "Secret.md"), new Date(T0), new Date(T0));
+		} });
+		const idx = { "Private/Secret.md": { m: T0 + 86_400_000, s: 24 } };
+		server = fakeServer({ "_manifest.json": JSON.stringify(idx), "Private/Secret.md": "the server's newer copy!" });
+		const lb = S.current;
+		check(S.running?.kind === "lifeboat" && lb.locked() && p.settings.restoreDeferred.length === 1, "not the locked lifeboat with a deferred restore");
+		await within(lb.finishLock(), 20_000, "finishLock");
+		await unlockApp(lb, "lifeboat unlock");
+		await within(lb.run(), 10_000, "lifeboat run");
+		check(privateWrites(server).length === 0, "the lifeboat wrote under Private/ while a restore was pending: " + privateWrites(server));
+		check(server.files.get("Private/Secret.md").toString() === "the server's newer copy!" && server.json("_manifest.json")["Private/Secret.md"].m === T0 + 86_400_000, "the server's newer copy or its index entry changed");
+		check(server.files.has("Note.md"), "the public note was not backed up");
+		check((server.json("_control/status.json").encryption?.restoreDeferred ?? []).join() === "move-1", "status.json does not show the pending restore");
 		await stopPlugin(p);
 		server = null;
 	}
@@ -2167,12 +2438,26 @@ async function main() {
 		const cur = S.current;
 		await within(cur.finishLock(), 20_000, "finishLock");
 		await unlockApp(cur);
+		// adapter.exists takes real I/O time in Obsidian: the quit's finishLock() then lands while
+		// the pass is still before its pause and marks it to skip (C.8 skipOnce), not only ends a
+		// pause already under way.
+		hooks.adapter = (name, a) => (name === "exists" && a[0] === H_DIR ? 40 : 0);
 		const t0 = Date.now();
 		await within(quit(app), 20_000, "the quit task");
 		const ms = Date.now() - t0;
+		resetHooks();
 		const d = disk(base);
 		check(cur.locked() && !fs.existsSync(path.join(base, V_DIR)) && d.plain === 0 && d.tmp === 0 && d.vlenc === 3, "after the quit task: " + dstr(d));
-		check(ms < 4_000, `the quit task took ${ms} ms for 3 files: the 5 s pause was not skipped`);
+		check(ms < PAUSE_BOUND, `the quit task took ${ms} ms for 3 files: the 5 s pause was not skipped`);
+		// The skip was one-shot (C.8): the next lock pauses again for the last edit's upload.
+		step = "24 the next lock after the quit's skip pauses again";
+		await unlockApp(cur);
+		fs.writeFileSync(path.join(base, V_DIR, "Two.md"), "two, edited before the lock");
+		await within(cur.lock(), 10_000, "lock");
+		await sleep(600);
+		check(fs.existsSync(path.join(base, H_DIR, "Two.md")) && !fs.existsSync(path.join(base, H_DIR, "Two.md.vlenc")), "the lock after the quit's finishLock() skipped its pause too: " + dstr(disk(base)));
+		await within(cur.finishLock(), 20_000, "finishLock");
+		encryptedOnDisk(base, ["Secret.md", "Two.md", "Three.bin"], "after the pause");
 		await stopPlugin(p);
 	}
 
@@ -2181,7 +2466,7 @@ async function main() {
 	const T0 = Date.parse("2026-11-10T08:00:00Z"), DAY = 86_400_000;
 	const SRV = { "Secret.md": "secret, the server's newer copy", "Sub/Deep.md": "deep, the server's newer copy", "Mine.md": "mine, the server's older copy" };
 	const LOC = { "Secret.md": "secret", "Sub/Deep.md": "deep, local and older", "Mine.md": "mine, local and newer" };
-	async function restoreSetup(id) {
+	async function restoreSetup(id, extraIdx = {}) {
 		let note;
 		const r = await startPlugin(VaultLockPlugin, ENC, null, { before: (b) => {
 			fs.mkdirSync(path.join(b, V_DIR, "Sub"));
@@ -2192,7 +2477,7 @@ async function main() {
 			const s = fs.statSync(path.join(b, "Note.md"));
 			note = { m: Math.floor(s.mtimeMs), s: s.size };
 		} });
-		const idx = { "Note.md": note };
+		const idx = { "Note.md": note, ...extraIdx };
 		const files = { "Note.md": "note", "_control/commands.json": JSON.stringify([{ id, cmd: "restore-all" }]) };
 		for (const rel of Object.keys(SRV)) {
 			idx["Private/" + rel] = { m: T0 + DAY, s: Buffer.byteLength(SRV[rel]) };
@@ -2261,6 +2546,29 @@ async function main() {
 		await stopPlugin(p);
 		server = null;
 	}
+	// One file of the deferred restore is gone from the server (a stale index key): it is listed,
+	// the others are restored, the record is cleared and the gate opens again. (A server error
+	// keeps the record, as above.)
+	step = "24 a deferred restore with a file gone from the server";
+	{
+		const { p, base, cur } = await restoreSetup("ra-5", { "Private/Gone.md": { m: T0 + DAY, s: 4 } });
+		const m0 = server.log.length;
+		await unlockApp(cur);
+		await within(cur.backup.queue, 15_000, "the reconcile after the unlock");
+		check(server.log.slice(m0).includes("GET Private/Gone.md"), "the deferred restore did not try the missing file");
+		check(p.settings.restoreDeferred.length === 0 && (readData(base).restoreDeferred ?? []).length === 0, "a file gone from the server kept the record for good: " + JSON.stringify(p.settings.restoreDeferred));
+		const txt = (rel) => fs.readFileSync(path.join(base, V_DIR, rel), "utf8");
+		check(txt("Secret.md") === SRV["Secret.md"] && txt("Sub/Deep.md") === SRV["Sub/Deep.md"] && txt("Mine.md") === LOC["Mine.md"] && !fs.existsSync(path.join(base, V_DIR, "Gone.md")), "the other files were not restored: " + JSON.stringify(Object.keys(LOC).map(txt)));
+		const detail = p.settings.commandLog["ra-5"]?.detail ?? "";
+		check(/deferred private files: 2 written/.test(detail) && /not restored: Private\/Gone\.md: .*missing on server/.test(detail), "commandLog detail does not list the missing file: " + detail);
+		check(/Gone\.md/.test(server.json("_control/status.json").lastError ?? "") || /Gone\.md/.test(server.json("_control/status.json").configError ?? ""), "status.json does not report the missing file: " + JSON.stringify(server.json("_control/status.json").configError));
+		await sleep(2_300);
+		await within(cur.backup.queue, 15_000, "the create events");
+		await reconcile(cur);
+		check(server.files.get("Private/Mine.md").toString() === LOC["Mine.md"], "the gate stayed closed: Mine.md was not uploaded after the record was cleared");
+		await stopPlugin(p);
+		server = null;
+	}
 	step = "24 a locked restore-all that fails after deferring";
 	{
 		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC);
@@ -2296,6 +2604,62 @@ async function main() {
 		await stopPlugin(p);
 		server = null;
 	}
+	// The same, but the folder rename after the restore fails for longer than its retry (a
+	// handle on a just-written file): the files were written, so the command is not a failure;
+	// the lock screen tries again every HIDE_RETRY_MS until the folder is hidden and encrypted.
+	step = "24 restore-all while locked, no .Private/ yet, and the folder rename keeps failing";
+	{
+		const T1 = Date.parse("2026-11-12T08:00:00Z");
+		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC, null, { before: (b) => fs.rmSync(path.join(b, V_DIR), { recursive: true }) });
+		const cur = S.current;
+		const idx = { "Private/Secret.md": { m: T1, s: Buffer.byteLength(SRV["Secret.md"]) } };
+		server = fakeServer({ "_manifest.json": JSON.stringify(idx), "Private/Secret.md": SRV["Secret.md"], "_control/commands.json": JSON.stringify([{ id: "ra-6", cmd: "restore-all" }]) });
+		const until = performance.now() + 3_600; // longer than RENAME_RETRY_MS, shorter than HIDE_RETRY_MS
+		const eperm = () => Object.assign(new Error("EPERM: operation not permitted, rename (test: held by another program)"), { code: "EPERM" });
+		hooks.adapter = (name, a) => { if (name === "rename" && folderRename(a[0], a[1]) === "hide" && performance.now() < until) throw eperm(); return 0; };
+		const t0 = Date.now();
+		cur.backup.onPaired(false);
+		await within(cur.backup.queue, 15_000, "reconcile");
+		check(p.settings.commandLog["ra-6"]?.ok === true && /1 files written/.test(p.settings.commandLog["ra-6"].detail ?? ""), "a restore whose files were all written is a failure: " + JSON.stringify(p.settings.commandLog["ra-6"]));
+		check(cur.locked() && fs.existsSync(path.join(base, V_DIR, "Secret.md")) && !fs.existsSync(path.join(base, H_DIR)), "the test's failing rename did not fail");
+		check(cur.privateFolder.stats().hideError, "hideError not set after the failed rename");
+		await waitFor(() => fs.existsSync(path.join(base, H_DIR)) && !fs.existsSync(path.join(base, V_DIR)), 16_000, "the hide retry after the restore");
+		console.log(`[smoke] the restored folder was hidden ${((Date.now() - t0) / 1000).toFixed(1)} s after the restore whose rename failed`);
+		resetHooks();
+		await within(cur.finishLock(), 20_000, "finishLock");
+		encryptedOnDisk(base, ["Secret.md"], "restored while locked, hidden by the retry");
+		check(privateWrites(server).length === 0, "sent under Private/: " + privateWrites(server));
+		await stopPlugin(p);
+		server = null;
+	}
+	// A lock that lands while a restore is fetching a private note: the note is neither written
+	// into the hidden folder nor left readable beside it; it waits for the next unlock (B8).
+	step = "24 a lock during a restore-all";
+	{
+		const T1 = Date.parse("2026-11-12T08:00:00Z");
+		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC);
+		const cur = S.current;
+		await within(cur.finishLock(), 20_000, "finishLock");
+		await unlockApp(cur);
+		const idx = { "Private/Lost.md": { m: T1, s: 14 } };
+		server = fakeServer({ "_manifest.json": JSON.stringify(idx), "Private/Lost.md": "lost note text", "_control/commands.json": JSON.stringify([{ id: "ra-7", cmd: "restore-all" }]) });
+		let lockedAt = null;
+		server.hold = (m, f) => (m === "GET" && f === "Private/Lost.md" && !lockedAt ? (lockedAt = cur.lock()) : null); // the lock lands during the GET
+		cur.backup.onPaired(false);
+		await within(cur.backup.queue, 15_000, "reconcile");
+		check(lockedAt && cur.locked(), "the lock during the GET did not happen");
+		await within(lockedAt, 10_000, "the lock");
+		check(!fs.existsSync(path.join(base, V_DIR)), "a readable Private/ was left beside the hidden folder: " + listFiles(path.join(base, V_DIR)));
+		check(!fs.existsSync(path.join(base, H_DIR, "Lost.md")) && !fs.existsSync(path.join(base, H_DIR, "Lost.md.vlenc")), "the restore wrote into the hidden folder: " + dstr(disk(base)));
+		const log = p.settings.commandLog["ra-7"];
+		check(log?.ok === true && /deferred/.test(log.detail ?? "") && p.settings.restoreDeferred.some((d) => d.id === "ra-7"), "the note caught by the lock is not deferred: " + JSON.stringify({ log, deferred: p.settings.restoreDeferred }));
+		await within(cur.finishLock(), 20_000, "finishLock");
+		await unlockApp(cur, "unlock after the deferred restore");
+		await within(cur.backup.queue, 15_000, "the reconcile after the unlock");
+		check(fs.readFileSync(path.join(base, V_DIR, "Lost.md"), "utf8") === "lost note text" && p.settings.restoreDeferred.length === 0, "the deferred note did not arrive after the unlock: " + listFiles(path.join(base, V_DIR)));
+		await stopPlugin(p);
+		server = null;
+	}
 	step = "24 stop during an encrypt";
 	{
 		let orig;
@@ -2313,6 +2677,13 @@ async function main() {
 			const x = fs.existsSync(path.join(base, H_DIR, rel)), v = fs.existsSync(path.join(base, H_DIR, rel + ".vlenc"));
 			check(x !== v, `${rel}: ${x ? "both forms" : "neither form"} after the stop`);
 		}
+		// A request that reaches the stopped app (a key or the switch arriving as it stops) queues
+		// nothing there: nobody could cancel such a pass, and the next copy has its own (B12).
+		const pf = cur.privateFolder, passes = pf.__passes;
+		pf.requestEncrypt();
+		pf.__fireRetry();
+		await sleep(500);
+		check(pf.__passes === passes && disk(base).plain === d.plain, `the stopped app ran a pass on request (${pf.__passes - passes} pass(es); plain ${d.plain} → ${disk(base).plain})`);
 		const q = await restartOn(base, VaultLockPlugin);
 		await within(q.S.current.finishLock(), 20_000, "finishLock after the restart");
 		const d2 = disk(base);
@@ -2384,9 +2755,12 @@ async function main() {
 		const visible = ([, f]) => f === V_DIR || f.startsWith(V_DIR + "/") || /(^|\/)Private(\/|$)/.test(f);
 		const first2 = ops.findIndex((o, i) => i >= mark && visible(o));
 		check(first2 >= 0 && first2 >= passEnded, `the second instance worked (${JSON.stringify(ops[first2])}) before the first instance's pass ended (op ${first2} < ${passEnded})`);
-		check(!ops.slice(passEnded).some(([, f]) => f.endsWith(".vlenc.tmp")), "the first instance's pass went on after its stop: " + JSON.stringify(ops.slice(passEnded).filter(([, f]) => f.endsWith(".vlenc.tmp"))));
 		check(!finished, "stop() resolved although a PUT is still unanswered (the test needs it held)");
 		const d2 = disk(base);
+		// The stop ended the pass at its file boundary (dispose() runs beside backup.stop(), not
+		// after the held PUT): most of the 31 files are still plaintext when the next instance's
+		// hide() has run (its own pass is in its pause).
+		check(d2.plain >= 20, "the first instance's pass went on after its stop (dispose() waited for the network): " + dstr(d2));
 		check(d2.tmp === 0 && fs.existsSync(path.join(base, H_DIR, "Late.md")) && !fs.existsSync(path.join(base, V_DIR)), "after the stop and the second hide(): " + dstr(d2));
 		// The file in progress was finished, not cut off: every note is in exactly one form.
 		for (const rel of Object.keys(orig)) {
@@ -2444,18 +2818,54 @@ async function main() {
 			check(d.plain === 0 && d.tmp === 0 && d.vlenc === 31, `after ${how} during the unlock: ` + dstr(d));
 			lockedStill(`after ${how}`);
 		}
-		step = "24c the rename back keeps failing";
-		const until = performance.now() + 40_000;
+		// A lock (or the quit) in the few hundred ms the passphrase check takes wins too: nothing is decrypted.
+		for (const how of ["lock()", "the quit task"]) {
+			step = `24c ${how} while the passphrase is checked`;
+			const unlocking = cur.lockScreen.tryUnlock("right");
+			const locking = how === "lock()" ? cur.lock() : quit(app);
+			check(await within(unlocking, 20_000, "the unlock") === true, "the right passphrase was answered as wrong");
+			await within(locking, 20_000, how);
+			lockedStill(`${how} during the passphrase check`);
+			const d = disk(base);
+			check(d.plain === 0 && d.tmp === 0 && d.vlenc === 31, `${how} during the passphrase check: something was decrypted: ` + dstr(d));
+			check(errText() === "Locked again.", `the error line after ${how}: ` + JSON.stringify(errText()));
+		}
 		const eperm = () => Object.assign(new Error("EPERM: operation not permitted, rename (test: held by another program)"), { code: "EPERM" });
-		hooks.adapter = (name, a) => { if (name === "rename" && folderRename(a[0], a[1]) === "show" && performance.now() < until) throw eperm(); return 0; };
-		hooks.fs = (name, a) => { if (/^rename/.test(name) && folderRename(a[0], a[1]) === "show" && performance.now() < until) throw eperm(); return 0; };
+		const failRenameBack = (ms) => {
+			const until = performance.now() + ms;
+			hooks.adapter = (name, a) => { if (name === "rename" && folderRename(a[0], a[1]) === "show" && performance.now() < until) throw eperm(); return 0; };
+			hooks.fs = (name, a) => { if (/^rename/.test(name) && folderRename(a[0], a[1]) === "show" && performance.now() < until) throw eperm(); return 0; };
+		};
+		// A rename back that fails for a moment (Defender scanning the fresh files) is retried: the unlock succeeds at once.
+		step = "24c the rename back fails for a second";
+		failRenameBack(1_000);
+		await unlockApp(cur, "the unlock whose rename fails for a second");
+		resetHooks();
+		sameSnap(snap(path.join(base, V_DIR)), orig, "after the unlock whose rename failed for a second");
+		await within(cur.lock(), 10_000, "lock");
+		await within(cur.finishLock(), 20_000, "finishLock");
+		check(disk(base).vlenc === 31, "not all encrypted again: " + dstr(disk(base)));
+		step = "24c the rename back keeps failing";
+		failRenameBack(40_000);
+		// exists(.Private) is slow, as attrib.exe makes the re-hide on Windows: finishLock() is
+		// called while the re-hide still runs, before it has queued its pass, and must wait for it.
+		const slowH = (name, a) => (name === "exists" && a[0] === H_DIR ? 300 : 0);
+		const failing = hooks.adapter;
+		hooks.adapter = (name, a) => slowH(name, a) || failing(name, a);
 		const t0 = Date.now();
 		check(await within(cur.lockScreen.tryUnlock("right"), 60_000, "the unlock whose rename fails") === true, "the right passphrase was answered as wrong");
-		console.log(`[smoke] the failing rename was given up after ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+		const gaveUp = Date.now() - t0;
+		console.log(`[smoke] the failing rename was given up after ${(gaveUp / 1000).toFixed(1)} s`);
+		check(gaveUp >= 29_000, `the rename back was given up after ${gaveUp} ms: SHOW_RENAME_RETRY_MS is 30 s`);
 		lockedStill("a rename that keeps failing");
 		check(errText() && !/^Unlocking/.test(errText()), "no error text after the failed unlock: " + JSON.stringify(errText()));
-		resetHooks();
+		hooks.fs = null;
+		hooks.adapter = slowH;
+		const f0 = Date.now();
 		await within(cur.finishLock(), 20_000, "finishLock");
+		const fms = Date.now() - f0;
+		resetHooks();
+		check(fms < PAUSE_BOUND, `finishLock after the failed unlock took ${fms} ms: the re-hide's pass did not skip the 5 s pause`);
 		const d = disk(base);
 		check(d.plain === 0 && d.tmp === 0 && d.vlenc === 31, "after the failed unlock: " + dstr(d));
 		step = "24c the next attempt unlocks";

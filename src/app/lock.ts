@@ -13,6 +13,8 @@ export class LockScreen {
 	unlocking = false;
 	/** A lock asked for during an unlock: the unlock stops before the folder comes back. */
 	lockRequested = false;
+	/** The passphrase is being checked (PBKDF2, a few hundred ms): a lock() meanwhile wins over the unlock that would follow. */
+	private checking = false;
 	private overlay: HTMLElement | null = null;
 	private err: HTMLElement | null = null;
 	private scope: Scope | null = null;
@@ -86,6 +88,8 @@ export class LockScreen {
 		// A stopped app never locks again (a blur timer can fire after stop): its lock screen would never go away.
 		if (this.owner.stopping) return Promise.resolve();
 		if (!this.hasPass) { new Notice("Vault Lock: set a passphrase in settings first."); return Promise.resolve(); }
+		// The passphrase is still being checked: the vault is locked, and the unlock stops once the check is done.
+		if (this.checking && this.locked) { this.lockRequested = true; return this.inflight ?? Promise.resolve(); }
 		if (this.unlocking && this.unlockDone) {
 			this.lockRequested = true;
 			// tryUnlock stores its re-hide in `inflight` before unlockDone resolves.
@@ -108,6 +112,19 @@ export class LockScreen {
 		}
 	}
 
+	/** A restore wrote private files visible while the window is locked (no hidden folder yet, or a
+	 *  lock that landed mid-restore): hide and encrypt them now. A failed rename is tried again
+	 *  every HIDE_RETRY_MS, as after a lock; never rejects (the restore's files were written). */
+	async ensureHidden(): Promise<void> {
+		if (!this.locked || this.owner.stopping) return;
+		try {
+			await this.owner.privateFolder.hide();
+		} catch (e) {
+			console.error("[VLB] hiding the restored private folder failed", e);
+			this.hideRetry();
+		}
+	}
+
 	/** The folder could not be renamed (a file held open): try again every HIDE_RETRY_MS while locked. */
 	private hideRetry(): void {
 		if (this.hideTimer) return;
@@ -125,7 +142,14 @@ export class LockScreen {
 	 *  back: a failed or cancelled show() keeps the lock screen up (with the reason) and re-hides. */
 	async tryUnlock(pass: string): Promise<boolean> {
 		const s = this.owner.settings;
-		const h = await hashPass(pass, s.passSalt);
+		this.lockRequested = false;
+		this.checking = true;
+		let h: string;
+		try {
+			h = await hashPass(pass, s.passSalt);
+		} finally {
+			this.checking = false;
+		}
 		if (!safeEqual(h, s.passHash)) {
 			this.failedAttempts++;
 			await new Promise((r) => setTimeout(r, Math.min(5000, 500 * this.failedAttempts)));
@@ -135,9 +159,10 @@ export class LockScreen {
 		if (this.owner.stopping) return false;
 		this.failedAttempts = 0;
 		this.owner.backup.control.offerPassphrase(pass);
+		// A lock asked for while the passphrase was checked (a blur, the quit task) wins: nothing is opened (B15).
+		if (this.lockRequested) { this.err?.setText("Locked again."); return true; }
 		const pf = this.owner.privateFolder;
 		this.unlocking = true;
-		this.lockRequested = false;
 		pf.progress = (t) => this.err?.setText(t ?? "");
 		let done = false;
 		this.unlockDone = (async () => {

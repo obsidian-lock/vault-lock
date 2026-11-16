@@ -454,11 +454,22 @@ def retire_stranger(state):
     state["devices"].remove(d)
     if d["id"] not in state["banned"]:
         state["banned"].append(d["id"])
+    # Only when empty; data is never deleted. The folder holds the published copy of its vault key
+    # from the first tick on (the master stays in KEY_DIR), so that copy and an empty _control/ do
+    # not count as data: without this, every retired stranger left a folder behind for good.
+    folder = os.path.join(DEVICES, d["folder"])
     try:
-        os.rmdir(os.path.join(DEVICES, d["folder"]))  # only when empty; data is never deleted
+        for n in ("vault-key.json", "vault-key.json.tmp"):
+            p = os.path.join(folder, "_control", n)
+            if os.path.exists(p):
+                os.remove(p)
+        if os.path.isdir(os.path.join(folder, "_control")):
+            os.rmdir(os.path.join(folder, "_control"))
+        os.rmdir(folder)
     except OSError:
         pass
-    log(f"full: retired the oldest stranger {d['name']} ({d['username']}); folder data/devices/{d['folder']} kept if not empty")
+    kept = " kept (not empty)" if os.path.exists(folder) else " removed (held nothing but its key copy)"
+    log(f"full: retired the oldest stranger {d['name']} ({d['username']}); folder data/devices/{d['folder']}{kept}")
     return True
 
 

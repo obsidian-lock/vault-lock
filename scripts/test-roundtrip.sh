@@ -531,4 +531,34 @@ process
 vlb vaultkey test | grep -qx "published copy: present" || fail "vaultkey after the move: copy not present"
 ok "vlb move: the same id gets the same key in its new folder"
 
+# ---- a retired stranger's folder ---------------------------------------------------------
+# Every folder holds the copy of its vault key from the first tick on. A stranger retired to make
+# room (open-door pairing) that never connected leaves no folder behind for good: the copy and an
+# empty _control/ are not data. Its master stays in KEY_DIR, and its id is banned as before.
+Q_ID=aaaaaaaaaaaaaaaa R_ID=bbbbbbbbbbbbbbbb
+python3 - "$VLB_ROOT/state.json" "$HASH" "$Q_ID" <<'PY'
+import json, sys
+p, h, qid = sys.argv[1:4]
+s = json.load(open(p))
+s["devices"].append({"id": qid, "username": "d-" + qid, "hash": h, "folder": "quiet-aaaaaa", "name": "quiet", "user": "ci",
+                     "os": "linux", "plugin": "1.9.0", "pairedAt": "2026-11-01T00:00:00Z", "mine": False, "frozen": None})
+json.dump(s, open(p, "w"), indent=2)
+PY
+mkdir -p "$D/quiet-aaaaaa"
+process
+[ -f "$D/quiet-aaaaaa/_control/vault-key.json" ] && [ -f "$KEYS/$Q_ID.json" ] || fail "the quiet stranger got no key"
+[ "$(find "$D/quiet-aaaaaa" -type f | wc -l | tr -d ' ')" = 1 ] || fail "the quiet stranger's folder holds more than its key copy: $(find "$D/quiet-aaaaaa" -type f)"
+strangers=$(jget "$VLB_ROOT/state.json" 'len([d for d in j["devices"] if not d.get("mine")])')
+printf '{"id": "%s", "hash": "%s", "name": "another", "user": "ci", "os": "linux", "plugin": "1.9.0"}' "$R_ID" "$HASH" > "$VLB_ROOT/inbox/$R_ID.json"
+lines=$(wc -l < "$LOGF")
+VLB_MAX_DEVICES="$strangers" python3 "$VLB" process > "$tmp/process.out" 2>&1 || { cat "$tmp/process.out"; fail "vlb process (full) failed"; }
+tail -n +"$((lines + 1))" "$LOGF" > "$tmp/retirelog"
+grep -q "retired the oldest stranger quiet (d-$Q_ID); folder data/devices/quiet-aaaaaa removed" "$tmp/retirelog" || { cat "$tmp/retirelog"; fail "the quiet stranger was not retired, or its folder was kept"; }
+[ ! -e "$D/quiet-aaaaaa" ] || fail "the retired stranger's folder is still there: $(find "$D/quiet-aaaaaa")"
+[ -f "$KEYS/$Q_ID.json" ] || fail "retiring the stranger removed its master key"
+[ "$(jget "$VLB_ROOT/state.json" '"'"$Q_ID"'" in j["banned"]')" = true ] || fail "the retired stranger is not banned"
+[ -d "$D/another-bbbbbb" ] && [ -f "$D/another-bbbbbb/_control/vault-key.json" ] || fail "the new stranger was not accepted with a key"
+: > "$tmp/docker-calls"
+ok "a retired stranger that held nothing but its key copy leaves no folder; its master and its ban stay"
+
 echo "all round-trip checks passed"

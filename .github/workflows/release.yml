@@ -8,7 +8,24 @@ on:
 permissions:
   contents: write
 jobs:
+  # The Windows runners prove the hidden-file rules, attrib.exe and the smoke test on NTFS the way
+  # ci.yml does. A Windows-only failure must block the release BRAT installs, not show up after it.
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm run build
+      - name: Unit and smoke tests (no server round trip on Windows)
+        run: npm run test:win
+      - name: Test hiding the private folder
+        shell: powershell
+        run: ./scripts/test-hide.ps1
   release:
+    needs: windows
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
