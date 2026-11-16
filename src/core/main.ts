@@ -1,9 +1,9 @@
 import { Notice, Plugin, PluginSettingTab } from "obsidian";
 import type { App as ObsidianApp } from "obsidian";
 import * as path from "path";
-import { STOP_TIMEOUT_MS, UNLOAD_COVER_MS } from "../shared/constants";
+import { QUIT_WAIT_MS, STOP_TIMEOUT_MS, UNLOAD_COVER_MS } from "../shared/constants";
 import { withTimeout } from "../shared/dav";
-import { DEFAULT_SETTINGS, VLBSettings } from "../shared/settings";
+import { DEFAULT_SETTINGS, DeferredRestore, VLBSettings } from "../shared/settings";
 import { Supervisor } from "./supervisor";
 
 /**
@@ -60,11 +60,20 @@ export default class VaultLockPlugin extends Plugin {
 		this.registerDomEvent(window, "beforeunload", () => this.supervisor.cleanExit());
 		// Closing Obsidian while unlocked used to leave the private folder visible on disk until
 		// the next start (seen on Windows, 2026-11-14). Lock on the way out: Obsidian waits for
-		// the task before it quits. A failed lock never holds up the quit.
+		// the task before it quits. The lock wins over an unlock under way; the encryption that
+		// follows the rename is waited for up to QUIT_WAIT_MS (leftovers are finished at the next
+		// start). A failed lock never holds up the quit.
 		this.registerEvent(this.app.workspace.on("quit", (tasks) => {
 			const current = this.supervisor.current;
 			if (!this.hasPass || !current) return;
-			tasks.add(() => current.lock().catch((e) => console.error("[VLB] locking at quit failed", e)));
+			tasks.add(async () => {
+				try {
+					await current.lock();
+					await withTimeout(current.finishLock?.() ?? Promise.resolve(), QUIT_WAIT_MS, "finishing the lock");
+				} catch (e) {
+					console.error("[VLB] locking at quit failed", e);
+				}
+			});
 		}));
 
 		await this.supervisor.startBest();
@@ -122,10 +131,18 @@ export default class VaultLockPlugin extends Plugin {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
 		this.settings.doneCommands = Array.isArray(saved.doneCommands) ? saved.doneCommands : [];
 		this.settings.commandLog = saved.commandLog && typeof saved.commandLog === "object" ? saved.commandLog : {};
+		// The vault key is used as it is on disk, or not at all.
+		const vk: unknown = saved.vaultKey;
+		this.settings.vaultKey = isObj(vk) && typeof vk.id === "string" && /^[a-f0-9]{16}$/.test(vk.id) && typeof vk.key === "string" && /^[a-f0-9]{64}$/.test(vk.key)
+			? { id: vk.id, key: vk.key } : null;
+		this.settings.encrypt = typeof saved.encrypt === "boolean" ? saved.encrypt : true;
+		this.settings.restoreDeferred = Array.isArray(saved.restoreDeferred) ? (saved.restoreDeferred as unknown[]).filter(validDeferred) : [];
 		if (restored) await this.saveSettings();
 	}
 
-	async saveSettings(): Promise<void> {
+	/** With strict, a failure to write the copy rejects too (the vault key counts as saved only
+	 *  when both files hold it). */
+	async saveSettings(strict = false): Promise<void> {
 		await this.saveData(this.settings);
 		// A second copy: Obsidian writes data.json in place, so a power cut mid-write would
 		// otherwise lose the passphrase hash and this computer's server login.
@@ -133,6 +150,7 @@ export default class VaultLockPlugin extends Plugin {
 			await this.app.vault.adapter.write(this.dataPath("data.bak.json"), JSON.stringify(this.settings));
 		} catch (e) {
 			console.error("[VLB] could not write data.bak.json", e);
+			if (strict) throw e;
 		}
 	}
 
@@ -149,6 +167,16 @@ export default class VaultLockPlugin extends Plugin {
 			return null;
 		}
 	}
+}
+
+function isObj(x: unknown): x is Record<string, unknown> {
+	return !!x && typeof x === "object" && !Array.isArray(x);
+}
+
+function validDeferred(x: unknown): x is DeferredRestore {
+	if (!isObj(x) || typeof x.id !== "string" || !x.id) return false;
+	if (x.cmd !== "restore-all" && x.cmd !== "pull") return false;
+	return x.paths === undefined || (Array.isArray(x.paths) && x.paths.every((p) => typeof p === "string"));
 }
 
 class VLBSettingTab extends PluginSettingTab {

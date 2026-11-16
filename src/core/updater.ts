@@ -1,9 +1,10 @@
 import * as fs from "fs";
 import * as path from "path";
 import { requestUrl, RequestUrlResponse } from "obsidian";
-import { CORE_VERSION } from "../shared/constants";
+import { CORE_VERSION, MIN_APP_VERSION } from "../shared/constants";
 import { DavAuth, davHeaders, davUrl, DavError, errMsg, withTimeout } from "../shared/dav";
 import { CONTROL } from "../shared/vaultfiles";
+import { cmpVersion } from "../shared/version";
 import type { CoreState } from "./health";
 import { BUNDLES, bundleName, loadStaged, STAGED_MANIFEST } from "./loader";
 import { checkBundle, sha256Hex, UpdatePayload, verifyManifest } from "./verify";
@@ -86,6 +87,8 @@ export class Updater {
 		const text = r.text;
 		const p = verifyManifest(text, this.ctx.keys());
 		if (p.kind !== "app") return this.err("app", `app: the app slot holds a ${p.kind} manifest`);
+		// Code without the encryption gate is never staged (see loader.loadStaged): nothing downloaded.
+		if (cmpVersion(p.version, MIN_APP_VERSION) < 0) return this.err("app", `app: older than ${MIN_APP_VERSION} (would move the private folder's server copies to _trash/); not staged`);
 		const local = loadStaged(dir, this.ctx.keys());
 		// "New" means later than both the last accepted at and the staged manifest's own (the
 		// truth on disk, also when core.json was lost or only the bundle file is damaged).
@@ -216,6 +219,8 @@ export class Updater {
 		if (r.status < 200 || r.status >= 300) return this.err("core", `core: HTTP ${r.status}`);
 		const p = verifyManifest(r.text, this.ctx.keys());
 		if (p.kind !== "core") return this.err("core", `core: the core slot holds an ${p.kind} manifest`);
+		// A main.js without the encryption gate would meet .vlenc files at the next start: never installed.
+		if (cmpVersion(p.version, MIN_APP_VERSION) < 0) return this.err("core", `core: older than ${MIN_APP_VERSION} (would move the private folder's server copies to _trash/); not installed`);
 		const mainFile = path.join(dir, MAIN);
 		const sha12 = p.sha256.slice(0, 12);
 		if (sha256Hex(fs.readFileSync(mainFile)) === p.sha256) {

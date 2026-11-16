@@ -23,6 +23,17 @@ import { excluded as isExcluded, Index, LocalFile, MANIFEST, parentOf, scan, sta
  * commands. Its health is reported to the server in `_control/status.json` (after every
  * reconcile, and on a failure when the server can still be reached) and read there with
  * `vlb status`. The developer console gets a `[VLB backup]` line for everything.
+ *
+ * The private folder (hidden and encrypted while locked; the server keeps readable copies):
+ * - the scan never lists the hidden folder, and skips the visible one while the "private
+ *   gate" is closed (the hidden folder exists, or a restore still owes private files);
+ * - every `Private/*` index key is kept while the gate is closed: nothing under it is PUT,
+ *   MOVEd or trashed then (the test lives in trash(), so every path that trashes honours it);
+ * - the one exception: an edit debounced across the lock is uploaded from the plaintext still
+ *   under the hidden name (the renamed-note rule in syncPath), never from the hidden name itself;
+ * - a visible note with an encrypted copy, a temp file or an undecryptable copy beside it is
+ *   not uploaded (the readable server copy may be the only readable one), and `.vlenc` /
+ *   `.vlenc.tmp` files are never uploaded from anywhere (vaultfiles.excluded).
  */
 
 const DEBOUNCE_MS = 2_000;
@@ -50,6 +61,8 @@ export class Backup {
 	private stopped = false;
 	private paired = false;
 	private trashSeq = 0;
+	/** Folder listings for encryptedFormExists(), one per folder per job. */
+	private listCache = new Map<string, Set<string>>();
 
 	constructor(private owner: VaultLockApp) {
 		this.control = new Control(owner, this);
@@ -195,6 +208,7 @@ export class Backup {
 		const path = f.path;
 		this.run(async () => {
 			const adapter = this.owner.app.vault.adapter;
+			this.listCache.clear();
 			// Lock/unlock renames Private <-> .Private; Obsidian reports that as a delete.
 			const alt = this.owner.privateFolder.altPath(path);
 			if (alt && (await adapter.exists(alt))) return;
@@ -208,6 +222,7 @@ export class Backup {
 		const isFolder = f instanceof TFolder;
 		const newPath = f.path;
 		this.run(async () => {
+			this.listCache.clear();
 			const from = this.serverPath(oldPath);
 			const to = this.serverPath(newPath);
 			if (from === to) return;
@@ -215,6 +230,10 @@ export class Backup {
 			const newEx = this.excluded(newPath);
 			if (newEx) { if (!oldEx) await this.trash(from, isFolder); return; }
 			if (oldEx) { await this.syncNew(newPath, isFolder); return; }
+			// A private note renamed while the gate is closed (a restore pending): no MOVE of server
+			// copies; the reconcile after the deferred restore uploads the new name and trashes the old.
+			const pf = this.owner.privateFolder;
+			if (pf.enabled && (pf.isPrivatePath(oldPath) || pf.isPrivatePath(newPath)) && (await this.gateClosed())) return;
 
 			await this.loadManifest();
 			const keys = this.keysUnder(from, isFolder);
@@ -310,6 +329,7 @@ export class Backup {
 
 	private async reconcile(reason: string): Promise<void> {
 		this.failed = false;
+		this.listCache.clear();
 		await this.loadManifest();
 		try {
 			await this.control.pull();
@@ -318,9 +338,19 @@ export class Backup {
 			this.control.configError = `config or commands not applied: ${errMsg(e)}`;
 			console.warn("[VLB backup] config or commands not applied; backing up anyway:", e);
 		}
+		try {
+			await this.control.runDeferredRestore();
+		} catch (e) {
+			// The restore stays owed (the gate stays closed for the private folder) and is tried again next run.
+			this.control.configError = `deferred restore not finished: ${errMsg(e)}`;
+			console.warn("[VLB backup] deferred restore not finished; backing up anyway:", e);
+		}
 
+		const pf = this.owner.privateFolder;
+		const gate = await this.gateClosed();
 		const local = new Map<string, LocalFile>();
-		await scan(this.owner.app.vault.adapter, "", local, (p) => this.excluded(p), (p) => this.serverPath(p));
+		// The hidden folder is never listed (a lock in the middle of a scan included); the visible one not while the gate is closed.
+		await scan(this.owner.app.vault.adapter, "", local, (p) => this.excluded(p) || pf.isHiddenPath(p) || (gate && pf.isPrivatePath(p)), (p) => this.serverPath(p));
 
 		let uploaded = 0;
 		const skipped: string[] = [];
@@ -334,6 +364,10 @@ export class Backup {
 		for (const [sp, info] of todo) {
 			if (this.stopped) break; // the index is still saved below
 			if (info.s > MAX_BYTES) { skipped.push(sp); continue; }
+			if (pf.isPrivateServerPath(sp) && (await this.encryptedFormExists(sp))) {
+				failed.push(`${sp}: an encrypted or undecryptable copy exists beside it; not uploaded`);
+				continue;
+			}
 			try {
 				if (await this.upload(info.path, sp, info.m, info.s)) uploaded++;
 			} catch (e) {
@@ -350,9 +384,12 @@ export class Backup {
 			}
 		}
 		let trashed = 0;
+		// Every private key is kept while the gate is (or became) closed: the scan did not list those files.
+		const gateNow = await this.gateClosed();
 		for (const sp of Object.keys(this.manifest)) {
 			if (this.stopped) break;
 			if (local.has(sp)) continue;
+			if (pf.isPrivateServerPath(sp) && (gate || gateNow)) continue;
 			try {
 				await this.trash(sp, false);
 				trashed++;
@@ -379,13 +416,59 @@ export class Backup {
 
 	private async syncPath(path: string): Promise<void> {
 		if (this.excluded(path)) return;
-		const st = await this.owner.app.vault.adapter.stat(path);
+		this.listCache.clear();
+		const adapter = this.owner.app.vault.adapter;
+		const pf = this.owner.privateFolder;
+		let readFrom = path;
+		if (pf.enabled && pf.isPrivatePath(path)) {
+			if (pf.isHiddenPath(path)) return; // never from the hidden name itself
+			if (this.owner.settings.restoreDeferred.length > 0) return; // nothing under Private/ until the deferred restore ran
+			if (await adapter.exists(pf.hiddenName)) {
+				if (await adapter.exists(path)) return; // a stray beside the hidden folder: never uploaded
+				// The renamed-note rule: the very note that was just locked, still plaintext under the hidden name.
+				const alt = pf.altPath(path);
+				if (!alt || !(await adapter.exists(alt))) return; // encrypted already, or gone: the next unlock
+				readFrom = alt;
+			} else if (await this.encryptedFormExists(this.serverPath(path))) {
+				return; // x.vlenc, x.vlenc.tmp or an undecryptable copy beside the visible x; the next reconcile reports it
+			}
+		}
+		const st = await adapter.stat(readFrom);
 		if (!st || st.type !== "file") return;
 		await this.loadManifest();
 		const sp = this.serverPath(path);
 		const cur = this.manifest[sp];
 		if (cur && cur.m === st.mtime && cur.s === st.size) return;
-		await this.upload(path, sp, st.mtime, st.size);
+		try {
+			await this.upload(readFrom, sp, st.mtime, st.size);
+		} catch (e) {
+			if (readFrom !== path && e instanceof FileError) return; // encrypted meanwhile
+			throw e;
+		}
+	}
+
+	/** The private gate (see the header): the hidden folder exists, or a restore still owes private files. */
+	private async gateClosed(): Promise<boolean> {
+		const pf = this.owner.privateFolder;
+		if (!pf.enabled) return false;
+		return (await this.owner.app.vault.adapter.exists(pf.hiddenName)) || this.owner.settings.restoreDeferred.length > 0;
+	}
+
+	/** x.vlenc, x.vlenc.tmp or x.undecryptable-… beside the visible x (sp = V/x). One listing per folder per job. */
+	private async encryptedFormExists(sp: string): Promise<boolean> {
+		const dir = parentOf(sp);
+		let names = this.listCache.get(dir);
+		if (!names) {
+			names = new Set<string>();
+			try {
+				for (const f of (await this.owner.app.vault.adapter.list(dir)).files) names.add(f.replace(/^\/+/, "").slice(dir ? dir.length + 1 : 0));
+			} catch { /* no such folder (locked): nothing beside it */ }
+			this.listCache.set(dir, names);
+		}
+		const base = sp.slice(dir ? dir.length + 1 : 0);
+		if (names.has(base + ".vlenc") || names.has(base + ".vlenc.tmp")) return true;
+		for (const n of names) if (n.startsWith(base + ".undecryptable-")) return true;
+		return false;
 	}
 
 	/** False when the file is over the size limit; the next reconcile reports it in status.json. */
@@ -416,6 +499,16 @@ export class Backup {
 	}
 
 	private async trash(sp: string, isFolder: boolean): Promise<void> {
+		// Whenever this job runs (a delete queued before a lock may run after an unlock): nothing
+		// under the private folder is trashed while the gate is closed, nor a note that still has
+		// an encrypted form beside it (the server copy may be the only readable one).
+		const pf = this.owner.privateFolder;
+		if (pf.enabled && pf.isPrivateServerPath(sp)) {
+			if ((await this.gateClosed()) || (!isFolder && (await this.encryptedFormExists(sp)))) {
+				console.log("[VLB backup] not trashed (private gate): " + sp);
+				return;
+			}
+		}
 		await this.loadManifest();
 		const keys = this.keysUnder(sp, isFolder);
 		// Nothing indexed there means nothing to keep. Obsidian reports a deleted folder's files

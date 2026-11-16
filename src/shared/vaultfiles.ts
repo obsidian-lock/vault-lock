@@ -14,9 +14,12 @@ export const TRASH = "_trash";
 export const CONTROL = "_control";
 
 /** Never backed up: the plugin's own folder (data.json holds the passphrase hash and this
- *  computer's server key), the server's own files, and the excludes lines. */
+ *  computer's server key), the server's own files, the excludes lines, and the private folder's
+ *  encrypted files and their temporary files (the server keeps readable copies only; this
+ *  covers the app, the lifeboat, live events and syncPath alike). */
 export function excluded(path: string, ownDir: string, excludes: string): boolean {
 	if (path === ownDir || path.startsWith(ownDir + "/") || path === MANIFEST) return true;
+	if (path.endsWith(".vlenc") || path.endsWith(".vlenc.tmp")) return true;
 	for (const reserved of [TRASH, CONTROL, PAIR_DIR]) {
 		if (path === reserved || path.startsWith(reserved + "/")) return true;
 	}

@@ -333,8 +333,17 @@ export class Supervisor {
 		let cfg: unknown;
 		try { cfg = JSON.parse(r.text); } catch { return r.status; } // being rewritten: keep the last values
 		const before = JSON.stringify(this.state.config);
-		this.state.config = parseCoreConfig(cfg && typeof cfg === "object" ? (cfg as Record<string, unknown>).core : undefined);
+		const o = cfg && typeof cfg === "object" ? (cfg as Record<string, unknown>) : {};
+		this.state.config = parseCoreConfig(o.core);
 		if (JSON.stringify(this.state.config) !== before) console.log("[VLB] core settings from the server:", this.state.config);
+		// The encryption switch reaches the computer under every app, the lifeboat included (it
+		// has no control channel). The app applies it at once when it runs; otherwise the next lock.
+		const enc = o.encrypt;
+		if (typeof enc === "boolean" && enc !== this.plugin.settings.encrypt) {
+			this.plugin.settings.encrypt = enc;
+			void this.plugin.saveSettings();
+			console.log(`[VLB] core: encryption ${enc ? "on" : "off"} (from the server)`);
+		}
 		return r.status;
 	}
 
@@ -523,8 +532,8 @@ export class HostImpl implements Host {
 	get settings(): VLBSettings {
 		return this.sup.plug.settings;
 	}
-	saveSettings(): Promise<void> {
-		return this.sup.plug.saveSettings();
+	saveSettings(strict?: boolean): Promise<void> {
+		return this.sup.plug.saveSettings(strict);
 	}
 	heartbeat(): void {
 		this.sup.beat(this);

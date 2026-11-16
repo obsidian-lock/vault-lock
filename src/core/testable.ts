@@ -4,3 +4,5 @@ export { pick, isBad, builtinCandidate, loadStaged, evaluateApp, bundleName, BUN
 export { verifyManifest, checkBundle, sha256Hex, VerifyError } from "./verify";
 export { readCoreState, writeCoreState, defaults, parseCoreConfig, CORE_FILE } from "./health";
 export { cmpVersion } from "../shared/version";
+export * from "../shared/vlenc";
+export { MIN_APP_VERSION } from "../shared/constants";

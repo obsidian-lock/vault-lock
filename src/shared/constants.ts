@@ -1,5 +1,5 @@
 /** The core's contract level; server bundles carry the lowest one they need (minCore). */
-export const CORE_VERSION = 1;
+export const CORE_VERSION = 2;
 /** App.start() must resolve within this. */
 export const START_TIMEOUT_MS = 30_000;
 /** App.stop() is awaited at most this long. */
@@ -29,8 +29,30 @@ export const LIFEBOAT_INTERVAL_MS = 600_000;
 export const LIFEBOAT_FIRST_MS = 8_000;
 /** Files over this size are not uploaded. */
 export const MAX_BYTES = 104_857_600;
-/** At start, the lock screen is up at once; the private folder hide (on Windows attrib over
- *  every file) is waited for at most this long, so it never makes a start miss its time limit. */
-export const HIDE_WAIT_MS = 5_000;
 /** A cover left behind by an unloading copy of the plugin removes itself after this. */
 export const UNLOAD_COVER_MS = 5_000;
+
+// ---- the private folder's encryption ------------------------------------------------
+
+/** After the lock's rename, before encrypting: time for the last edit's upload to read the
+ *  plaintext from the hidden folder. An unlock, a stop or the quit task end it at once. */
+export const ENC_PAUSE_MS = 5_000;
+/** The lock's folder rename is retried this long (a file held open, an antivirus scan). */
+export const RENAME_RETRY_MS = 3_000;
+export const RENAME_RETRY_STEP_MS = 250;
+/** The unlock's rename back is retried this long under "Unlocking…" (Defender scanning fresh files). */
+export const SHOW_RENAME_RETRY_MS = 30_000;
+/** A per-file rename or unlink failing with EPERM/EACCES/EBUSY is retried this long. */
+export const FS_RETRY_MS = 2_000;
+export const FS_RETRY_STEP_MS = 250;
+/** A folder rename still failing is retried this often while locked. */
+export const HIDE_RETRY_MS = 10_000;
+/** A file that could not be encrypted is retried this often while locked. */
+export const BUSY_RETRY_MS = 60_000;
+/** The quit task waits this long for the background encryption. */
+export const QUIT_WAIT_MS = 20_000;
+/** Bigger files are hidden, not encrypted, and reported. */
+export const MAX_ENCRYPT_BYTES = MAX_BYTES;
+/** The core refuses a server bundle (either slot) older than this: that code would move the
+ *  private folder's readable server copies to _trash/ and show encrypted files. */
+export const MIN_APP_VERSION = "1.9.0";

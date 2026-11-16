@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { BAD_RETRY_MS, CORE_VERSION } from "../shared/constants";
+import { BAD_RETRY_MS, CORE_VERSION, MIN_APP_VERSION } from "../shared/constants";
 import { API, AppModule } from "../shared/contract";
 import { cmpVersion } from "../shared/version";
 import { checkBundle, verifyManifest } from "./verify";
@@ -88,6 +88,9 @@ export function loadStaged(pluginDir: string, keysHex: string[]): ServerCandidat
 		sha256: p.sha256, minCore: p.minCore, file, verified: false, why: "", at: p.at,
 	};
 	if (p.kind !== "app") return { ...c, why: "the staged manifest is for a " + p.kind + " bundle" };
+	// Older code has no encryption gate: it would upload ciphertext and move the readable server
+	// copies of the private notes to _trash/. Not even when forced (a stale forced rollback).
+	if (cmpVersion(p.version, MIN_APP_VERSION) < 0) return { ...c, why: `app older than ${MIN_APP_VERSION} (would move the private folder's server copies to _trash/)` };
 	let bytes: Buffer;
 	try {
 		bytes = fs.readFileSync(file);

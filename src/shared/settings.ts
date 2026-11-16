@@ -1,5 +1,9 @@
 export type CmdResult = { ok: boolean; at: string; detail?: string };
 
+/** A restore-all or pull that met a hidden private folder: its private files are written at the
+ *  first backup run after the next unlock, never into the hidden folder. */
+export type DeferredRestore = { id: string; cmd: "restore-all" | "pull"; paths?: string[] };
+
 export interface VLBSettings {
 	passHash: string;
 	passSalt: string;
@@ -18,6 +22,14 @@ export interface VLBSettings {
 	doneCommands: string[];
 	/** results of the most recent remote commands, reported in _control/status.json */
 	commandLog: Record<string, CmdResult>;
+	/** The server's key for this computer's private folder (AES-256, hex), as published in
+	 *  _control/vault-key.json. It is kept here on purpose, so locking works offline and a locked
+	 *  start can finish an interrupted lock; the server holds the master. Never made here. */
+	vaultKey: { id: string; key: string } | null;
+	/** Encrypt the private folder while locked (the server's config.json can turn it off). */
+	encrypt: boolean;
+	/** Restores that still owe their private files (see DeferredRestore). */
+	restoreDeferred: DeferredRestore[];
 }
 
 export const DEFAULT_SETTINGS: VLBSettings = {
@@ -34,4 +46,7 @@ export const DEFAULT_SETTINGS: VLBSettings = {
 	excludes: [".trash/", ".obsidian/workspace"].join("\n"),
 	doneCommands: [],
 	commandLog: {},
+	vaultKey: null,
+	encrypt: true,
+	restoreDeferred: [],
 };

@@ -31,7 +31,8 @@ test("pick: the precedence table", () => {
 		["server 1.6.9 unforced", { server: server("1.6.9") }, "builtin", "superseded"],
 		["server 1.6.9 force", { server: server("1.6.9", { force: true }) }, "server", "waiting"],
 		["server unverified", { server: server("9.9.9", { verified: false, why: "signature invalid" }) }, "builtin", "rejected"],
-		["server minCore 2", { server: server("9.9.9", { minCore: 2 }) }, "builtin", "rejected"],
+		["server minCore 2 (= this core)", { server: server("9.9.9", { minCore: 2 }) }, "server", "waiting"],
+		["server minCore 3", { server: server("9.9.9", { minCore: 3 }) }, "builtin", "rejected"],
 		["server bad n=2 fresh", { server: S, bad: { [S.id]: { n: 2, at: at(NOW - H), why: "throw" } } }, "builtin", "bad"],
 		["server bad n=2 aged 25 h", { server: S, bad: { [S.id]: { n: 2, at: at(NOW - 25 * H), why: "throw" } } }, "server", "waiting"],
 		["server bad n=1", { server: S, bad: { [S.id]: { n: 1, at: at(NOW), why: "crash" } } }, "server", "waiting"],
@@ -49,7 +50,7 @@ test("pick: the precedence table", () => {
 		assert.equal(p.serverState, serverState, `${name}: serverState`);
 	}
 	assert.equal(pick({ server: server("9.9.9", { verified: false, why: "signature invalid" }) }).why, "signature invalid");
-	assert.equal(pick({ server: server("9.9.9", { minCore: 2 }) }).why, "needs core ≥ 2");
+	assert.equal(pick({ server: server("9.9.9", { minCore: 3 }) }).why, "needs core ≥ 3");
 	assert.equal(pick({ safeMode: true }).why, "safe mode");
 });
 
@@ -180,4 +181,96 @@ test("evaluateApp: the module shape of the contract, with the given require", ()
 	assert.throws(() => T.evaluateApp("module.exports = { API: 1 };", require), /createApp/);
 	assert.throws(() => T.evaluateApp("module.exports = {", require), SyntaxError);
 	assert.throws(() => T.evaluateApp("throw new Error('top level')", require), /top level/);
+});
+
+// ---- G.4: code older than 1.9.0 is refused in both slots (it would move the private notes' server copies to _trash/) ----
+
+test("server app 1.8.0 force → builtin, rejected (loadStaged refuses it, pick shows why)", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vlb-old-"));
+	try {
+		const code = "module.exports = { API: 1, createApp() { return {}; } };\n";
+		stageFiles(dir, code, { version: "1.8.0", force: true });
+		const S = T.loadStaged(dir, [KEY]);
+		assert.equal(S.verified, false);
+		assert.equal(S.code, undefined, "no code comes with it");
+		assert.match(S.why, /older than 1\.9\.0/);
+		const p = T.pick({ safeMode: false, builtin: T.builtinCandidate("1.9.0"), server: S, bad: {}, now: NOW });
+		assert.equal(p.choice, "builtin");
+		assert.equal(p.serverState, "rejected");
+		assert.match(p.why, /older than 1\.9\.0/);
+		// The floor itself, and the first version above it.
+		assert.equal(T.MIN_APP_VERSION, "1.9.0");
+		stageFiles(dir, code, { version: "1.9.0" });
+		assert.equal(T.loadStaged(dir, [KEY]).verified, true, "1.9.0 passes");
+		stageFiles(dir, code, { version: "1.8.99", force: true });
+		assert.equal(T.loadStaged(dir, [KEY]).verified, false, "1.8.99 is still older");
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// The updater needs "obsidian" (requestUrl): scripts/.build/updater.cjs resolves it to this object.
+globalThis.window = globalThis;
+const slots = new Map(); // server path → { status, body }
+const gets = [];
+globalThis.__vlbObsidian = {
+	requestUrl: async ({ url, method }) => {
+		const sp = url.slice("https://vault.test/".length).split("/").map(decodeURIComponent).join("/");
+		gets.push(`${method} ${sp}`);
+		const r = slots.get(sp);
+		const body = Buffer.from(r?.body ?? "");
+		return { status: r?.status ?? 404, headers: {}, text: body.toString("utf8"), arrayBuffer: body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) };
+	},
+};
+const U = require("./.build/updater.cjs");
+function signed(kind, version, bytes, more = {}) {
+	const p = Buffer.from(JSON.stringify({ v: 1, kind, version, sha256: sha(bytes), size: bytes.length, force: false, minCore: 1, at: "2026-11-05T12:00:00Z", ...more }));
+	return JSON.stringify({ payload: p.toString("base64"), sig: crypto.sign(null, p, KP.privateKey).toString("base64") });
+}
+
+test("core slot 1.8.0 → refused, main.js unchanged, lastAcceptedAt.core unchanged; app slot 1.8.0 → nothing downloaded", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vlb-slot-"));
+	try {
+		const mainJs = Buffer.from("module.exports = { default: class { onload() {} } }; // the installed main.js\n");
+		fs.writeFileSync(path.join(dir, "main.js"), mainJs);
+		fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ id: "vault-lock", version: "1.9.0" }));
+		const st = T.defaults();
+		st.lastAcceptedAt.core = "2026-11-01T00:00:00Z";
+		const up = new U.Updater({ pluginDir: () => dir, auth: () => ({ base: "https://vault.test/", user: "u", pass: "p" }), keys: () => [KEY], req: require, state: () => st, save: () => {}, alive: () => true });
+
+		const oldCore = Buffer.from("module.exports = { default: class { onload() {} } }; // 1.8.0\n");
+		slots.set("_control/update/core/manifest.json", { status: 200, body: signed("core", "1.8.0", oldCore) });
+		slots.set("_control/update/core/main.js", { status: 200, body: oldCore });
+		await up.pollCoreSlot(true);
+		assert.match(st.updateError, /^core: older than 1\.9\.0/);
+		assert.ok(fs.readFileSync(path.join(dir, "main.js")).equals(mainJs), "main.js unchanged");
+		assert.equal(fs.existsSync(path.join(dir, "main.js.prev")), false, "no copy aside");
+		assert.equal(st.lastAcceptedAt.core, "2026-11-01T00:00:00Z", "lastAcceptedAt.core unchanged");
+		assert.equal(st.coreInstalled, null);
+		assert.ok(!gets.includes("GET _control/update/core/main.js"), "main.js was not downloaded");
+
+		const oldApp = Buffer.from("module.exports = { API: 1, createApp() {} }; // 1.8.0\n");
+		slots.set("_control/update/app/manifest.json", { status: 200, body: signed("app", "1.8.0", oldApp, { force: true }) });
+		slots.set("_control/update/app/app.js", { status: 200, body: oldApp });
+		await up.pollAppSlot(true);
+		assert.match(st.updateError, /app: older than 1\.9\.0/);
+		assert.equal(fs.existsSync(path.join(dir, T.BUNDLES)), false, "nothing staged");
+		assert.equal(st.staged, null);
+		assert.equal(st.lastAcceptedAt.app, "");
+		assert.ok(!gets.includes("GET _control/update/app/app.js"), "app.js was not downloaded");
+
+		// A current one in each slot goes through as before (the floor is the only change).
+		gets.length = 0;
+		slots.set("_control/update/app/manifest.json", { status: 200, body: signed("app", "1.9.0", oldApp, { minCore: 2 }) });
+		await up.pollAppSlot(true);
+		assert.equal(st.staged?.version, "1.9.0", st.updateError);
+		assert.ok(gets.includes("GET _control/update/app/app.js"));
+		slots.set("_control/update/core/manifest.json", { status: 200, body: signed("core", "1.9.0", oldCore, { minCore: 2 }) });
+		await up.pollCoreSlot(true);
+		assert.equal(st.coreInstalled?.version, "1.9.0", st.updateError);
+		assert.ok(fs.readFileSync(path.join(dir, "main.js")).equals(oldCore), "the 1.9.0 core was installed");
+		assert.equal(st.updateError, null);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
 });

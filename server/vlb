@@ -23,22 +23,38 @@ Layout under ROOT (/opt/obsidian-webdav):
   inbox/                     pairing requests land here
   data/devices/<folder>/     one folder per paired computer: the vault, _manifest.json,
                              _trash/ and _control/ (_control/update/app and /core hold the
-                             signed plugin code published with vlb bundle)
+                             signed plugin code published with vlb bundle; vault-key.json
+                             is the copy of the computer's vault key)
   vlb.log                    what vlb did
 Elsewhere:
   /root/.config/vault-lock/  the signing key (signing.pem, root only; never in the nightly
                              snapshot), signing.pub.pem and signing.spki.hex
+  /root/.config/vault-lock/vault-keys/<id>.json
+                             the master vault keys (root only): one random AES-256 key per
+                             computer, made by vlb process when the computer pairs. Each is
+                             copied to the computer's _control/vault-key.json (in the
+                             snapshot), and the plugin (1.9.0 and later) encrypts the private
+                             folder with it while locked. A lost master comes back from that
+                             copy; a key is never replaced or rotated
   /root/vault-lock-bundles/  the bundle archive: one folder per version with app.js and/or
                              main.js, the signed manifests as published, meta.json
 
 Commands:
   vlb status                 pairing state and every computer: name, user, the addresses
-                             it connects from, size, last check-in, last error (the
-                             plugin shows nothing on the computer itself)
+                             it connects from, size, last check-in, last error, the
+                             encryption of its private folder (the plugin shows nothing on
+                             the computer itself)
   vlb mine COMPUTER          mark a computer as yours: never frozen, always in the snapshot
   vlb passphrase COMPUTER    show the copy of that computer's vault passphrase (for the day
                              it is forgotten). Every paired computer sends one after the
                              passphrase is set, changed or typed to unlock
+  vlb vaultkey COMPUTER      show that computer's vault key (also for a removed one, by its
+                             login), whether its folder has the copy, what the plugin
+                             reports, and the .vlenc file format (to decrypt a file by hand)
+  vlb encrypt on|off [--only COMPUTER]...
+                             on (the default): the plugin encrypts the private folder at
+                             each lock; off: it decrypts at the next unlock and later locks
+                             only hide (read within 10 minutes)
   vlb move COMPUTER FOLDER   that computer continues an existing folder (a new or
                              reinstalled laptop picks up an old backup); it pairs again
                              and gets the folder's files back before its first backup
@@ -46,7 +62,7 @@ Commands:
                              its folder is kept (vlb move lets it back in)
   vlb close                  pause: new computers wait (they keep asking every minute)
   vlb open [--only NAME]     resume; --only accepts just the computer with that name
-  vlb process                handle the inbox and the caps (the timer runs this)
+  vlb process                handle the inbox, the caps and the vault keys (the timer runs this)
   vlb apply [--no-restart]   regenerate the configs from state.json and restart if changed
 
 Plugin code from the server (plugin 1.7.0 and later; BRAT stays the normal way to update).
@@ -66,7 +82,8 @@ bundle only sends the plugin back to its own built-in code. None of these restar
                              than its own built-in code or --force is given (a rollback).
                              --core: a main.js that replaces the plugin itself at the next
                              Obsidian start; only a main.js fetched from a release, unless
-                             --unsafe-local
+                             --unsafe-local. Versions older than 1.9.0 are refused (they
+                             have no encryption gate); 1.9.x needs core 2, 2.x core 3
   vlb bundle unpublish [--core] [--only COMPUTER]...
                              take it back: the plugin returns to its built-in code at the
                              next lock (a core bundle already installed stays)
@@ -75,7 +92,7 @@ bundle only sends the plugin back to its own built-in code. None of these restar
                              backup) from its next check (within 10 minutes); off: normal
 
 COMPUTER is a name (if unique), login, id or folder as shown by `vlb status`. Without
---only, the bundle and safemode commands act on every computer marked yours.
+--only, the bundle, safemode and encrypt commands act on every computer marked yours.
 Caps (env overrides, for tests): VLB_MAX_DEVICES=100 VLB_DEVICE_MAX_MB=10240
 VLB_OTHERS_MAX_MB=30720 VLB_DISK_MIN_FREE_MB=10240 VLB_CHECK_MINUTES=1
 Paths (env overrides, for tests): VLB_ROOT VLB_KEY_DIR VLB_ARCHIVE VLB_RELEASES
@@ -132,6 +149,17 @@ SPKI_PREFIX = "302a300506032b6570032100"  # DER header of every Ed25519 public k
 SLOT_FILE = {"app": "app.js", "core": "main.js"}
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 TIME_FMT = "%Y-%m-%dT%H:%M:%SZ"
+# Plugin code older than 1.9.0 has no encryption gate: it would upload the .vlenc files and
+# move the readable private notes on the server to _trash/. It is never published again.
+MIN_PUBLISH = (1, 9, 0)
+FLOOR = ".".join(map(str, MIN_PUBLISH))
+MIN_CORE = (((2, 0, 0), 3), ((1, 9, 0), 2))  # version -> the core contract level it needs; else 1
+
+# The vault keys (plugin 1.9.0 and later): one random AES-256 key per computer, made here.
+# The master copy lives outside ROOT like the signing key; each device folder holds a copy in
+# _control/vault-key.json, which the plugin fetches and keeps.
+VAULT_KEYS = os.path.join(KEY_DIR, "vault-keys")  # <id>.json, dir 700, files 600
+KEY_HEX_RE = re.compile(r"^[a-f0-9]{64}$")
 
 ID_RE = re.compile(r"^[a-f0-9]{16}$")
 HASH_RE = re.compile(r"^\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}$")
@@ -332,6 +360,75 @@ def passphrase_copy(folder):
     return c if isinstance(c, dict) and isinstance(c.get("passphrase"), str) else None
 
 
+# ---- vault keys -------------------------------------------------------------------------
+
+def vault_key_path(rid):
+    return os.path.join(VAULT_KEYS, rid + ".json")
+
+
+def published_key_path(d):
+    return os.path.join(DEVICES, d["folder"], "_control", "vault-key.json")
+
+
+def valid_key(k, rid):
+    return isinstance(k, dict) and k.get("id") == rid and bool(KEY_HEX_RE.match(str(k.get("key") or "")))
+
+
+def vault_key(rid, make=True, d=None):
+    """The master key of a computer (by id): {v, id, key, at}; None if make is False and there is none.
+    A key file that exists but does not parse is NEVER replaced (it may still be the only copy): RuntimeError.
+    A missing master is first looked for in the device folder's published copy (the VPS rebuilt from the
+    nightly snapshot, which holds the folders but not KEY_DIR): a valid copy becomes the master. Only when
+    there is no copy anywhere is a key made. A key is never generated while any valid copy exists."""
+    path = vault_key_path(rid)
+    k = read_json(path)
+    if valid_key(k, rid):
+        return k
+    if os.path.exists(path):
+        raise RuntimeError(f"{path} exists but is not a valid key file; not touched")
+    pub = read_json(published_key_path(d)) if d else None
+    if valid_key(pub, rid):
+        k = {"v": 1, "id": rid, "key": pub["key"], "at": pub.get("at") or now()}
+        write_master(path, k)
+        log(f"vault key of {d['name']}: master recovered from the published copy")
+        return k
+    if not make:
+        return None
+    k = {"v": 1, "id": rid, "key": secrets.token_hex(32), "at": now()}
+    write_master(path, k)
+    log(f"made the vault key for d-{rid}")
+    return k
+
+
+def write_master(path, k):
+    os.makedirs(KEY_DIR, 0o700, exist_ok=True)
+    os.makedirs(VAULT_KEYS, 0o700, exist_ok=True)
+    os.chmod(VAULT_KEYS, 0o700)  # root only, like the signing key
+    write_json(path, k)  # 0600 (write_json's default)
+
+
+def key_body(k):
+    """What a device folder's vault-key.json holds."""
+    return {"v": 1, "id": k["id"], "key": k["key"], "at": k["at"]}
+
+
+def publish_vault_key(d):
+    body = key_body(vault_key(d["id"], d=d))
+    if read_json(published_key_path(d)) != body:
+        write_json(published_key_path(d), body, 0o644)
+        log(f"vault key of {d['name']} written to its folder")
+
+
+def ensure_vault_keys(state):
+    """Every computer has a master key and its copy in its folder. Idempotent: a write only when
+    the copy is missing or differs (a new pairing, a moved folder, a copy someone overwrote)."""
+    for d in state["devices"]:
+        try:
+            publish_vault_key(d)
+        except (OSError, RuntimeError) as e:
+            log(f"could not write the vault key for {d['name']}: {e}")
+
+
 def accept(state, req):
     move = state["moves"].pop(req["id"], None)
     folder = move["folder"] if move else unique_folder(state, f"{req['name']}-{req['id'][:6]}")
@@ -463,6 +560,8 @@ def process(state):
     for f in files:
         if os.path.exists(f):
             os.remove(f)
+    # Before apply(): a computer paired just now has its key before its login works.
+    ensure_vault_keys(state)
     if changed:
         apply(state)
     else:
@@ -707,6 +806,57 @@ def published_lines(folder, s):
     return lines
 
 
+def encryption_line(folder, s):
+    """What the plugin (1.9.0 and later) reports about the private folder's encryption."""
+    if not s:
+        return []  # the health line already says it never checked in
+    e = s.get("encryption")
+    if e is None:
+        return ["    encryption: (plugin older than 1.9.0)"]
+    if not isinstance(e, dict):
+        raise TypeError("encryption is not an object")
+    files, plain, undecryptable = int(e.get("files") or 0), int(e.get("plain") or 0), int(e.get("undecryptable") or 0)
+    failed, too_big, deferred = e.get("failed") or [], e.get("tooBig") or [], e.get("restoreDeferred") or []
+    if not all(isinstance(x, list) for x in (failed, too_big, deferred)):
+        raise TypeError("failed, tooBig or restoreDeferred is not a list")
+    counts = f"{files} file{'' if files == 1 else 's'} encrypted" + "".join(
+        f", {n} {what}" for n, what in ((plain, "plain"), (len(failed), "failed"), (undecryptable, "undecryptable"),
+                                        (len(too_big), "over 100 MB")) if n)
+    key_id, key_state = e.get("keyId"), e.get("keyState")
+    if e.get("on") is False:
+        line = f"OFF (vlb encrypt on turns it on), {counts}"
+    elif not key_id:
+        pub = read_json(os.path.join(DEVICES, folder, "_control", "vault-key.json"))
+        if isinstance(pub, dict) and KEY_HEX_RE.match(str(pub.get("key") or "")):
+            line = f"on, NO KEY on the computer yet (published {pub.get('at') or '?'}; picked up at its next backup run)"
+        else:
+            line = "on, NO KEY on the computer yet (none published yet: vlb process makes one within 15 s)"
+    elif key_state == "mismatch":
+        line = (f"on, key {key_id} KEY MISMATCH: the server publishes {e.get('serverKeyId') or '?'} "
+                f"(the computer keeps its own; see vlb vaultkey)")
+    else:
+        line = f"on, key {key_id}, {counts}"
+    lines = ["    encryption: " + line]
+    problems = []
+    if e.get("hideError"):
+        problems.append(f"folder not hidden: {e['hideError']}")
+    if failed:
+        more = f"; and {len(failed) - 5} more" if len(failed) > 5 else ""
+        problems.append("failed: " + "; ".join(str(f) for f in failed[:5]) + more)
+    if problems:
+        lines.append("    encryption problems: " + "; ".join(problems))
+    if key_state == "unsaved" or e.get("keyDurable") is False:
+        lines.append(f"    encryption problems: key not saved on the computer (keyState {key_state}): "
+                     f"nothing is encrypted until data.json can be written")
+    if deferred:
+        lines.append(f"    encryption problems: private restore pending ({', '.join(str(x) for x in deferred)}): "
+                     f"private files are not backed up until the first backup run after an unlock")
+    if e.get("fileRecovery") == "unavailable":
+        lines.append("    encryption problems: file recovery: unavailable (Obsidian changed; its snapshots of private "
+                     "notes were not deleted)")
+    return lines
+
+
 def lines_of(what, fn, *args):
     """fn's lines for vlb status. A computer writes its own status.json (and passphrase.json,
     config.json), a stranger's too, so they can hold anything: an odd one costs one line."""
@@ -743,7 +893,8 @@ def cmd_status(state):
         s = last_seen(d["folder"])
         for line in (lines_of("last check-in", health_line, s) + lines_of("plugin code", code_lines, s)
                      + lines_of("published", published_lines, d["folder"], s)
-                     + lines_of("passphrase copy", passphrase_line, d["folder"], s)):
+                     + lines_of("passphrase copy", passphrase_line, d["folder"], s)
+                     + lines_of("encryption", encryption_line, d["folder"], s)):
             print(line)
     if state["banned"]:
         print(f"Removed for good: {len(state['banned'])} computer(s) (vlb move lets one back in)")
@@ -944,6 +1095,18 @@ def version_key(v):
     return tuple(parts + [0] * (3 - len(parts)))
 
 
+def too_old(version):
+    """True for a version below MIN_PUBLISH (or not a version at all)."""
+    v = version_key(version)
+    return v is None or v < MIN_PUBLISH
+
+
+def min_core(version):
+    """The minCore a bundle of this version carries: a 1.9.x bundle needs the core of 1.9.0
+    (2), a 2.x one that of 2.0.0 (3). Call it only for a version that passed too_old()."""
+    return next((c for v, c in MIN_CORE if version_key(version) >= v), 1)
+
+
 def next_at(state, slot):
     """now(), but always after the last publish in this slot: the plugin ignores a manifest
     that is not newer than the last one it accepted (replay guard)."""
@@ -978,10 +1141,10 @@ def sign(payload):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def signed_manifest(slot, version, data, force, at, note=None):
+def signed_manifest(slot, version, data, force, at, note=None, min_core=1):
     """The signed manifest.json for a bundle: {payload, sig}."""
     p = {"v": 1, "kind": slot, "version": version, "sha256": sha256_hex(data), "size": len(data),
-         "force": force, "minCore": 1, "at": at}
+         "force": force, "minCore": min_core, "at": at}
     if note is not None:
         p["note"] = note  # the plugin accepts a string or nothing, never null
     payload = json.dumps(p, separators=(",", ":")).encode("utf-8")
@@ -1045,10 +1208,13 @@ def cmd_publish(state, args):
         sys.exit(f"--version must look like 1.7.0, not {version!r}")
     devs, tgt = targets(state, only)
     data, version, where = bundle_source(words[0], name, version, "--unsafe-local" in opts, core)
+    if too_old(version):  # before anything is written, the archive included
+        sys.exit(f"{version} is older than {FLOOR}: plugin code without the encryption gate would move the readable "
+                 f"private notes on the server to _trash/ and show encrypted files; not published")
     if not 0 < len(data) <= MAX_BUNDLE:
         sys.exit(f"{name} is {len(data)} bytes; it must be 1 to {MAX_BUNDLE} bytes")
     sha, at = sha256_hex(data), next_at(state, slot)
-    envelope = signed_manifest(slot, version, data, force, at, note)
+    envelope = signed_manifest(slot, version, data, force, at, note, min_core(version))
 
     # The archive keeps what was published, so it can be published again (vlb mine signs it again).
     vdir = os.path.join(ARCHIVE, version)
@@ -1141,6 +1307,74 @@ def cmd_safemode(state, args):
     print("The plugin switches at its next check (within 10 minutes) or start.")
 
 
+def cmd_encrypt(state, args):
+    words, _, only = options(args)
+    if words not in (["on"], ["off"]):
+        sys.exit("Usage: vlb encrypt on|off [--only COMPUTER]...")
+    on = words[0] == "on"
+    devs, _ = targets(state, only)
+    for d in devs:
+        # The app and the core read the same file: keep every other key as it is.
+        path = os.path.join(DEVICES, d["folder"], "_control", "config.json")
+        cfg = as_dict(read_json(path))
+        cfg["encrypt"] = on
+        write_json(path, cfg, 0o644)
+    log(f"encryption {'on' if on else 'off'} for {', '.join(d['name'] for d in devs)}")
+    print("The plugin reads it at its next backup run (within 10 minutes). on: encrypts at the next lock. "
+          "off: decrypts at the next unlock; later locks only hide.")
+
+
+VLENC_FORMAT = ('A .vlenc file is: "VLENC1", 0x01, 8-byte key id, 8-byte mtime (ms, big-endian), 12-byte IV, '
+                "AES-256-GCM ciphertext+tag; the 35-byte header is the AAD.")
+
+
+def key_report(s, rid):
+    """What the plugin says about its key in status.json, for vlb vaultkey."""
+    if not s:
+        return "nothing yet (never checked in)"
+    e = s.get("encryption")
+    if not isinstance(e, dict):
+        return "plugin older than 1.9.0"
+    if not e.get("keyId"):
+        return "no key yet"
+    line = f"key {e['keyId']}, {int(e.get('files') or 0)} files encrypted"
+    if e["keyId"] != rid:
+        line += " (NOT this key: the computer holds the key of d-" + str(e["keyId"]) + ")"
+    elif e.get("keyState") == "mismatch":
+        line += f" (KEY MISMATCH: it found {e.get('serverKeyId') or '?'} in its folder and kept its own)"
+    return line
+
+
+def cmd_vaultkey(state, key):
+    d = find_device(state, key)
+    rid = d["id"] if d else device_id(key)
+    if not rid:
+        sys.exit(f"No paired computer matches {key!r}. For a removed one give its login (d-...). See: vlb status")
+    try:
+        k = vault_key(rid, make=False, d=d)  # never makes a key; a missing master may come back from the copy
+    except RuntimeError as e:
+        sys.exit(str(e))
+    if not k:
+        sys.exit(f"No vault key for d-{rid} yet; vlb process makes one within 15 s" if d
+                 else f"No vault key for d-{rid}: it is not paired, and no key was ever made for it")
+    print(f"Vault key of {d['name'] if d else 'a computer that is not paired now'} (d-{rid}, made {k.get('at') or '?'}): {k['key']}")
+    if d:
+        path = published_key_path(d)
+        if read_json(path) == key_body(k):
+            print("published copy: present")
+        elif not os.path.exists(path):
+            print("published copy: MISSING (next vlb process tick writes it)")
+        else:
+            print("published copy: DIFFERENT from the master (next vlb process tick writes it)")
+        try:
+            print("plugin reports: " + key_report(last_seen(d["folder"]), rid))
+        except (TypeError, ValueError) as e:  # status.json is written by the computer: it can hold anything
+            print(f"plugin reports: (not understood: {type(e).__name__})")
+    else:
+        print("published copy: (computer removed)")  # its folder is not known any more
+    print(VLENC_FORMAT)
+
+
 def copy_mine_bundles(state, d):
     """A computer newly marked yours also gets the bundles published to your computers: the
     archived file, signed again as the record says (its force, a fresh at). The archived
@@ -1150,6 +1384,10 @@ def copy_mine_bundles(state, d):
         rec = as_dict(rec)
         if slot not in SLOT_FILE or rec.get("targets") != "mine":
             continue
+        if too_old(rec.get("version")):  # the record stays; only a new publish replaces it
+            log(f"not copied: the {slot} bundle {rec.get('version')} published to your computers is older than "
+                f"{FLOOR}; publish a current one")
+            continue
         try:
             with open(os.path.join(ARCHIVE, str(rec.get("version")), SLOT_FILE[slot]), "rb") as f:
                 data = f.read()
@@ -1158,7 +1396,8 @@ def copy_mine_bundles(state, d):
             if not os.path.exists(KEY):
                 raise ValueError("no signing key")
             at = next_at(state, slot)
-            put_bundle(d, slot, data, signed_manifest(slot, rec["version"], data, rec.get("force") is True, at))
+            put_bundle(d, slot, data, signed_manifest(slot, rec["version"], data, rec.get("force") is True, at,
+                                                      min_core=min_core(rec["version"])))
         except (OSError, ValueError, TypeError, KeyError, SystemExit) as e:  # sign() stops with sys.exit
             log(f"could not copy the {slot} bundle {rec.get('version')} to {d['name']} ({e}); publish it again")
             continue
@@ -1253,6 +1492,10 @@ def main(argv):
             cmd_unpublish(state, args[1:])
         elif cmd == "safemode":
             cmd_safemode(state, args)
+        elif cmd == "encrypt":
+            cmd_encrypt(state, args)
+        elif cmd == "vaultkey" and len(args) == 1:
+            cmd_vaultkey(state, args[0])
         else:
             sys.exit(f"Unknown command: {' '.join(argv)}. See: vlb help")
 

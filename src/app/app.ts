@@ -1,7 +1,6 @@
 import { Component } from "obsidian";
 import type { App as ObsidianApp, PluginManifest } from "obsidian";
 import css from "../../styles.css";
-import { HIDE_WAIT_MS } from "../shared/constants";
 import { API, App, Host } from "../shared/contract";
 import { PrivateFolder } from "../shared/privateFolder";
 import type { VLBSettings } from "../shared/settings";
@@ -47,8 +46,8 @@ export class VaultLockApp extends Component implements App {
 		return this.host.settings;
 	}
 
-	saveSettings(): Promise<void> {
-		return this.host.saveSettings();
+	saveSettings(strict?: boolean): Promise<void> {
+		return this.host.saveSettings(strict);
 	}
 
 	async start(): Promise<void> {
@@ -60,15 +59,10 @@ export class VaultLockApp extends Component implements App {
 		if (__VLB_FAULT__ === "throw-start") throw new Error("test fault: throw-start");
 		if (__VLB_FAULT__ === "hang-start") await new Promise<void>(() => {});
 
-		// Lock before the UI renders. lock() puts the lock screen up at once and then hides the
-		// private folder (also when Obsidian crashed while unlocked and Private/ is still
-		// visible on disk). Locked is what the start needs: the hide (on Windows attrib over every
-		// file) goes on after it when slow, so a big folder never makes the start time out.
-		if (this.lockScreen.hasPass && __VLB_FAULT__ !== "never-lock") {
-			let t = 0;
-			await Promise.race([this.lockScreen.lock(), new Promise((r) => { t = window.setTimeout(r, HIDE_WAIT_MS); })]);
-			window.clearTimeout(t);
-		}
+		// Lock before the UI renders. lock() puts the lock screen up at once and resolves once the
+		// private folder is renamed away (also when Obsidian crashed while unlocked and Private/
+		// is still visible on disk); its encryption goes on in the background.
+		if (this.lockScreen.hasPass && __VLB_FAULT__ !== "never-lock") await this.lockScreen.lock();
 		if (this.stopping) return;
 		this.lockScreen.install();
 
@@ -87,11 +81,10 @@ export class VaultLockApp extends Component implements App {
 
 	private async finish(): Promise<void> {
 		this.stopping = true;
-		try {
-			await this.backup.stop();
-		} finally {
-			this.lockScreen.destroy();
-		}
+		// Side by side: the encryption pass stops at its next file whatever the network does, so the
+		// core's stop bound can only ever cut off requests, never a half-written file.
+		await Promise.allSettled([this.privateFolder.dispose(), this.backup.stop()]);
+		this.lockScreen.destroy();
 	}
 
 	onunload(): void {
@@ -102,12 +95,17 @@ export class VaultLockApp extends Component implements App {
 		this.lockScreen.destroy();
 	}
 
+	/** Not while an unlock decrypts: the core would switch apps in the middle of it. */
 	locked(): boolean {
-		return this.lockScreen.locked || this.lockedAtUnload;
+		return (this.lockScreen.locked && !this.lockScreen.unlocking) || this.lockedAtUnload;
 	}
 
 	lock(): Promise<void> {
 		return this.lockScreen.lock();
+	}
+
+	finishLock(): Promise<void> {
+		return this.privateFolder.finishLock();
 	}
 
 	changePassphrase(): void {

@@ -23,8 +23,10 @@ export type LeftCover = { el: HTMLElement; timer: number; swallow: (e: KeyboardE
 declare global {
 	interface Window {
 		/** Left by a copy of the plugin that is being unloaded (a BRAT update, a disable): the
-		 *  next copy waits for `stopping` before it starts, and takes over `cover`. */
-		__vaultLock?: { stopping?: Promise<void>; cover?: LeftCover };
+		 *  next copy waits for `stopping` before it starts, and takes over `cover`. `pf` holds
+		 *  one serial chain per vault for the private folder's jobs (shared/privateFolder.ts), so
+		 *  two copies of the plugin never transform the folder at the same time. */
+		__vaultLock?: { stopping?: Promise<void>; cover?: LeftCover; pf?: Record<string, Promise<void>> };
 	}
 }
 

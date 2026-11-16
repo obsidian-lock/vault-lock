@@ -21,8 +21,9 @@ export interface Host {
 	readonly settings: VLBSettings;
 	/** What this host was created for. */
 	readonly running: RunningInfo;
-	/** data.json and data.bak.json. */
-	saveSettings(): Promise<void>;
+	/** data.json and data.bak.json. With strict, a failure to write the copy rejects too (the
+	 *  vault key is used only once both files hold it). */
+	saveSettings(strict?: boolean): Promise<void>;
 	/** A reconcile just proved it can write to the server. */
 	heartbeat(): void;
 	/** Snapshot for the "core" section of status.json. */
@@ -42,6 +43,9 @@ export interface App extends Component {
 	locked(): boolean;
 	/** "Lock vault now" */
 	lock(): Promise<void>;
+	/** Resolves once the private folder's background encryption after a lock is done (the quit
+	 *  task waits for it). Optional: an older app.js without it is awaited for lock() only. */
+	finishLock?(): Promise<void>;
 	/** Opens the passphrase dialog (set or change). */
 	changePassphrase(): void;
 	/** Body of the setting tab; el is already empty. */

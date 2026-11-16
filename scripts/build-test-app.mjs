@@ -1,12 +1,13 @@
 // Builds app.js with a test fault, for the Mac scenarios and the smoke test:
 //   node scripts/build-test-app.mjs MODE... [--out DIR]     (default DIR: scripts/.build)
 // writes DIR/app-MODE.js. Modes: throw-start, hang-start, never-lock, no-heartbeat (see
-// src/app/app.ts and src/app/backup.ts). Never touches main.js or app.js; never for release.
+// src/app/app.ts and src/app/backup.ts), runtime (the fault stops of src/shared/vlenc.ts armed:
+// globalThis.__vlbFault names the step). Never touches main.js or app.js; never for release.
 import esbuild from "esbuild";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const MODES = ["throw-start", "hang-start", "never-lock", "no-heartbeat"];
+export const MODES = ["throw-start", "hang-start", "never-lock", "no-heartbeat", "runtime"];
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 export async function buildTestApp(mode, outDir = path.join(root, "scripts/.build")) {

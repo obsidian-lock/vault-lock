@@ -1,7 +1,7 @@
 import type { VaultLockApp } from "./app";
 import type { Backup } from "./backup";
 import { computerName } from "../shared/computer";
-import { CmdResult } from "../shared/settings";
+import { CmdResult, DeferredRestore } from "../shared/settings";
 import { CONTROL, Entry, parentOf } from "../shared/vaultfiles";
 
 /**
@@ -9,26 +9,38 @@ import { CONTROL, Entry, parentOf } from "../shared/vaultfiles";
  * WebDAV server, next to the backup:
  *
  *   config.json    written by the server, read by the plugin every reconcile; server wins
- *                  (its "core" key is for the core and ignored here)
+ *                  (its "core" key is for the core and ignored here; "encrypt" turns the
+ *                  private folder's encryption on or off)
  *   commands.json  [{ id, cmd, paths? }]  executed once each (ids are remembered)
  *   status.json    written by the plugin after every reconcile and on a failure:
- *                  version, health, last run, command results
+ *                  version, health, last run, command results, encryption
  *   passphrase.json written by the plugin once paired: a copy of the vault passphrase, for
  *                  the day it is forgotten (`vlb passphrase` shows it). Sent after the
  *                  passphrase is set, changed or typed to unlock; never kept on disk here.
+ *   vault-key.json written by the server: the key for this computer's private folder. Read
+ *                  once, saved in data.json and data.bak.json, never replaced (a different
+ *                  key later is reported as a mismatch).
  *
  * Nothing connects inbound to the laptop; the plugin polls over the same transport the
  * backup already uses, so if backups work, control works.
+ *
+ * A restore (restore-all, pull) that meets the hidden private folder never writes into it:
+ * its private files are remembered in settings.restoreDeferred (saved before the command is
+ * marked done) and written at the first reconcile after the next unlock, with the same rules
+ * as the command itself. Until then the backup leaves everything under the private folder
+ * alone, so an older local note can never be uploaded over the newer server copy.
  */
 
 const CONFIG = `${CONTROL}/config.json`;
 const COMMANDS = `${CONTROL}/commands.json`;
 const STATUS = `${CONTROL}/status.json`;
 const PASSPHRASE = `${CONTROL}/passphrase.json`;
+const VAULT_KEY = `${CONTROL}/vault-key.json`;
 const MAX_DONE = 300;
 const MAX_LOG = 50;
 
 type Command = { id: string; cmd: string; paths?: string[] };
+type Written = "written" | "same" | "kept" | "refused" | "deferred";
 /** `skipped`: over 100 MB. `failed`: "path: reason" for files that could not be backed up this time. */
 export type ReconcileSummary = { at: string; reason: string; files: number; uploaded: number; trashed: number; skipped: string[]; failed: string[] };
 
@@ -36,8 +48,12 @@ export class Control {
 	configError = "";
 	/** The last reconcile that completed since Obsidian started; null until the first one. */
 	lastReconcile: ReconcileSummary | null = null;
+	/** What the last look at vault-key.json found. "unsaved": the key arrived but data.json or data.bak.json could not be written. */
+	keyState: "ok" | "none" | "mismatch" | "invalid" | "unsaved" = "none";
+	serverKeyId: string | null = null;
 	/** The passphrase as typed, held in memory only until the server has its copy. Never written to disk here. */
 	private pendingPass: string | null = null;
+	private mismatchLogged = false;
 
 	constructor(private owner: VaultLockApp, private backup: Backup) {}
 
@@ -47,6 +63,7 @@ export class Control {
 		await this.applyConfig();
 		await this.runCommands();
 		await this.sendPassphrase(); // a copy that could not be sent earlier (not paired yet, server unreachable)
+		await this.fetchVaultKey(); // last: the three above never wait on it
 	}
 
 	/** `at` is when this was written; `lastError` is null while the backup is healthy. */
@@ -64,6 +81,7 @@ export class Control {
 			settings: { idleMinutes: s.idleMinutes, lockOnBlur: s.lockOnBlur, reconcileMinutes: s.reconcileMinutes, excludes: s.excludes.split("\n").filter(Boolean), privateFolder: s.privateFolder },
 			commands: s.commandLog,
 			core: this.coreStatus(),
+			encryption: { ...this.owner.privateFolder.stats(), keyState: this.keyState, serverKeyId: this.serverKeyId, restoreDeferred: s.restoreDeferred.map((d) => d.id) },
 		};
 		await this.backup.ensureDir(CONTROL);
 		await this.backup.dav("PUT", STATUS, JSON.stringify(body, null, 2), { "Content-Type": "application/json" });
@@ -95,6 +113,7 @@ export class Control {
 		if (!cfg || typeof cfg !== "object") return;
 		const s = this.owner.settings;
 		let changed = false;
+		let turnedOn = false;
 		if (typeof cfg.idleMinutes === "number" && cfg.idleMinutes >= 0 && cfg.idleMinutes !== s.idleMinutes) { s.idleMinutes = cfg.idleMinutes; changed = true; }
 		if (typeof cfg.lockOnBlur === "boolean" && cfg.lockOnBlur !== s.lockOnBlur) { s.lockOnBlur = cfg.lockOnBlur; changed = true; }
 		if (typeof cfg.reconcileMinutes === "number" && cfg.reconcileMinutes >= 1 && cfg.reconcileMinutes !== s.reconcileMinutes) {
@@ -104,7 +123,57 @@ export class Control {
 			const ex = cfg.excludes.filter((x): x is string => typeof x === "string").join("\n");
 			if (ex !== s.excludes) { s.excludes = ex; changed = true; }
 		}
+		// A missing key leaves the setting as it is (on by default).
+		if (typeof cfg.encrypt === "boolean" && cfg.encrypt !== s.encrypt) { s.encrypt = cfg.encrypt; changed = true; turnedOn = cfg.encrypt; }
 		if (changed) await this.owner.saveSettings();
+		// A hidden folder is encrypted now, not at the next lock.
+		if (turnedOn) this.owner.privateFolder.requestEncrypt();
+	}
+
+	// ---- the vault key -----------------------------------------------------------
+
+	/** The server's key for this computer, applied once: saved in both settings files before
+	 *  anything is encrypted with it; a different key published later is reported, never taken. */
+	private async fetchVaultKey(): Promise<void> {
+		const s = this.owner.settings;
+		const pf = this.owner.privateFolder;
+		const r = await this.backup.dav("GET", VAULT_KEY);
+		if (r.status === 404) { this.keyState = s.vaultKey ? "ok" : "none"; return; }
+		let k: { v?: unknown; id?: unknown; key?: unknown } | null = null;
+		try { k = JSON.parse(r.text); } catch { /* invalid */ }
+		if (!k || typeof k !== "object" || k.v !== 1 || typeof k.id !== "string" || !/^[a-f0-9]{16}$/.test(k.id) || typeof k.key !== "string" || !/^[a-f0-9]{64}$/.test(k.key)) {
+			this.keyState = "invalid";
+			return;
+		}
+		const id = k.id, key = k.key;
+		if (!s.vaultKey) {
+			pf.keyDurable = false;
+			s.vaultKey = { id, key }; // in memory only until both files hold it: nothing encrypts meanwhile
+			try {
+				await this.owner.host.saveSettings(true);
+			} catch (e) {
+				s.vaultKey = null;
+				this.keyState = "unsaved";
+				throw e; // nothing was encrypted; the next reconcile tries again
+			}
+			pf.keyDurable = true;
+			this.keyState = "ok";
+			this.serverKeyId = null;
+			console.log(`[VLB control] vault key received (id ${id})`);
+			pf.requestEncrypt();
+			return;
+		}
+		if (s.vaultKey.id !== id || s.vaultKey.key !== key) {
+			this.keyState = "mismatch";
+			this.serverKeyId = id;
+			if (!this.mismatchLogged) {
+				this.mismatchLogged = true;
+				console.error(`[VLB control] the server publishes vault key ${id}; this computer keeps its own (${s.vaultKey.id})`);
+			}
+		} else {
+			this.keyState = "ok";
+			this.serverKeyId = null;
+		}
 	}
 
 	// ---- passphrase copy -------------------------------------------------------
@@ -164,6 +233,7 @@ export class Control {
 			s.doneCommands = Array.from(done).filter((id) => (list as Command[]).some((x) => x && x.id === id)).slice(-MAX_DONE);
 			s.commandLog[c.id] = res;
 			for (const k of Object.keys(s.commandLog).slice(0, -MAX_LOG)) delete s.commandLog[k];
+			// Also saves a restoreDeferred record the command left: the two reach disk together.
 			await this.owner.saveSettings();
 			console.log(`[VLB control] ${c.cmd} (${c.id}): ${res.ok ? "ok" : "FAILED"} ${res.detail ?? ""}`);
 		}
@@ -181,9 +251,9 @@ export class Control {
 				await this.owner.lockScreen.lock();
 				return "locked";
 			case "pull":
-				return await this.pullPaths(c.paths ?? []);
+				return await this.pullPaths(c.paths ?? [], c.id);
 			case "restore-all":
-				return await this.restoreAll();
+				return await this.restoreAll(c.id);
 			default:
 				throw new Error("unknown command");
 		}
@@ -192,37 +262,91 @@ export class Control {
 	// ---- server -> vault -------------------------------------------------------
 
 	/** Write the server's copy of each path (file or folder) into the vault, unconditionally. */
-	async pullPaths(paths: string[]): Promise<string> {
+	async pullPaths(paths: string[], id = ""): Promise<string> {
 		await this.backup.loadManifest();
 		const m = this.backup.manifest;
-		let n = 0, refused = 0;
-		for (const raw of paths) {
-			if (typeof raw !== "string") continue;
-			const p = raw.replace(/^\/+|\/+$/g, "");
-			if (!p) continue;
-			const keys = m[p] ? [p] : Object.keys(m).filter((k) => k.startsWith(p + "/"));
-			if (keys.length === 0) throw new Error(`"${p}" is not in the server index`);
-			for (const k of keys) {
-				const r = await this.writeFromServer(k, m[k], true);
-				if (r === "written") n++;
-				else if (r === "refused") refused++;
+		const n = { written: 0, refused: 0, deferred: 0 };
+		const clean = paths.filter((p): p is string => typeof p === "string").map((p) => p.replace(/^\/+|\/+$/g, "")).filter(Boolean);
+		this.wrotePrivate = false;
+		try {
+			for (const p of clean) {
+				const keys = m[p] ? [p] : Object.keys(m).filter((k) => k.startsWith(p + "/"));
+				if (keys.length === 0) throw new Error(`"${p}" is not in the server index`);
+				for (const k of keys) this.tally(n, await this.writeFromServer(k, m[k], true), { id, cmd: "pull", paths: clean });
 			}
+		} finally {
+			await this.hideIfLocked();
 		}
-		return `${n} files written` + (refused ? `, ${refused} plugin files refused` : "");
+		return `${n.written} files written` + (n.refused ? `, ${n.refused} plugin files refused` : "") + deferredNote(n.deferred);
 	}
 
 	/** Write every indexed file that is missing locally or older than the server copy. A note edited here since its last backup is kept. */
-	async restoreAll(): Promise<string> {
+	async restoreAll(id = ""): Promise<string> {
 		await this.backup.loadManifest();
-		let written = 0, kept = 0, refused = 0;
-		for (const [sp, e] of Object.entries(this.backup.manifest)) {
-			if (!this.backup.enabled) throw new Error(`stopped (plugin reloaded or closed) after ${written} files; send restore-all again`);
-			const r = await this.writeFromServer(sp, e, false);
-			if (r === "written") written++;
-			else if (r === "kept") kept++;
-			else if (r === "refused") refused++;
+		const n = { written: 0, kept: 0, refused: 0, deferred: 0 };
+		this.wrotePrivate = false;
+		try {
+			for (const [sp, e] of Object.entries(this.backup.manifest)) {
+				if (!this.backup.enabled) throw new Error(`stopped (plugin reloaded or closed) after ${n.written} files; send restore-all again`);
+				this.tally(n, await this.writeFromServer(sp, e, false), { id, cmd: "restore-all" });
+			}
+		} finally {
+			await this.hideIfLocked();
 		}
-		return `${written} files written` + (kept ? `, ${kept} newer local files kept` : "") + (refused ? `, ${refused} plugin files refused` : "");
+		return `${n.written} files written` + (n.kept ? `, ${n.kept} newer local files kept` : "") + (n.refused ? `, ${n.refused} plugin files refused` : "") + deferredNote(n.deferred);
+	}
+
+	/** Counts one result; the first deferred private file records the command in the settings
+	 *  (idempotent on id), so a throw later in the loop still leaves the record for runCommands' save. */
+	private tally(n: { written: number; kept?: number; refused: number; deferred: number }, r: Written, d: DeferredRestore): void {
+		if (r === "written") n.written++;
+		else if (r === "kept") n.kept = (n.kept ?? 0) + 1;
+		else if (r === "refused") n.refused++;
+		else if (r === "deferred") {
+			n.deferred++;
+			const s = this.owner.settings;
+			if (d.id && !s.restoreDeferred.some((x) => x.id === d.id)) s.restoreDeferred.push(d);
+		}
+	}
+
+	/** A restore into a vault whose private folder is not hidden while the window is locked (no
+	 *  folder at all before): the files were written visible; hide and encrypt them now. */
+	private async hideIfLocked(): Promise<void> {
+		const wrote = this.wrotePrivate;
+		this.wrotePrivate = false;
+		const pf = this.owner.privateFolder;
+		if (!wrote || !pf.enabled || !this.owner.lockScreen.locked) return;
+		if (await this.owner.app.vault.adapter.exists(pf.hiddenName)) return;
+		await pf.hide();
+	}
+
+	/** Set by writeFromServer when a private file was written visible; read by hideIfLocked. */
+	private wrotePrivate = false;
+
+	/** The private files a restore-all or pull left for after the unlock: written at the first
+	 *  reconcile that finds the folder visible, with the command's own rules. A throw leaves the
+	 *  record in place (tried again next run); the gate stays closed meanwhile. */
+	async runDeferredRestore(): Promise<void> {
+		const s = this.owner.settings;
+		const pf = this.owner.privateFolder;
+		if (!s.restoreDeferred.length || !pf.enabled) return;
+		if (await this.owner.app.vault.adapter.exists(pf.hiddenName)) return; // still locked: wait
+		this.wrotePrivate = false;
+		for (const d of s.restoreDeferred.slice()) {
+			await this.backup.loadManifest();
+			const m = this.backup.manifest;
+			let keys = Object.keys(m).filter((k) => pf.isPrivateServerPath(k));
+			if (d.cmd === "pull") keys = keys.filter((k) => (d.paths ?? []).some((p) => k === p || k.startsWith(p + "/")));
+			const n = { written: 0, kept: 0, refused: 0, deferred: 0 };
+			for (const k of keys) this.tally(n, await this.writeFromServer(k, m[k], d.cmd === "pull"), d);
+			this.wrotePrivate = false;
+			if (n.deferred) { console.log(`[VLB control] deferred ${d.cmd} (${d.id}): locked again meanwhile; the rest waits for the next unlock`); break; }
+			s.restoreDeferred = s.restoreDeferred.filter((x) => x !== d);
+			const log = s.commandLog[d.id];
+			if (log) log.detail = (log.detail ?? "") + `; deferred private files: ${n.written} written, ${n.kept} newer local kept`;
+			await this.owner.saveSettings();
+			console.log(`[VLB control] deferred ${d.cmd} (${d.id}): ${n.written} private files written, ${n.kept} newer local kept`);
+		}
 	}
 
 	/** Plugin code never comes from the server: inside the plugins folder only data.json files
@@ -238,12 +362,15 @@ export class Control {
 		return under(plugins) && parts[parts.length - 1] !== "data.json";
 	}
 
-	private async writeFromServer(sp: string, e: Entry, force: boolean): Promise<"written" | "same" | "kept" | "refused"> {
+	private async writeFromServer(sp: string, e: Entry, force: boolean): Promise<Written> {
 		if (this.refused(sp)) {
 			console.warn(`[VLB control] not written: ${sp} (plugin code is never taken from the server)`);
 			return "refused";
 		}
 		const adapter = this.owner.app.vault.adapter;
+		const pf = this.owner.privateFolder;
+		// Never into the hidden folder: it waits for the first reconcile after the unlock.
+		if (pf.isPrivateServerPath(sp) && (await adapter.exists(pf.hiddenName))) return "deferred";
 		const local = await this.backup.toLocal(sp);
 		const st = await adapter.stat(local);
 		const haveLocal = !!st && st.type === "file";
@@ -268,6 +395,7 @@ export class Control {
 		const st2 = await adapter.stat(local);
 		this.backup.manifest[sp] = { m: st2?.mtime ?? e.m, s: st2?.size ?? e.s };
 		this.backup.touchManifest();
+		if (pf.isPrivateServerPath(sp)) this.wrotePrivate = true;
 		return "written";
 	}
 
@@ -280,6 +408,10 @@ export class Control {
 			if (!(await adapter.exists(cur))) await adapter.mkdir(cur);
 		}
 	}
+}
+
+function deferredNote(n: number): string {
+	return n ? `, ${n} private files deferred (locked): they are restored at the first backup run after the next unlock` : "";
 }
 
 /** Path parts the way Windows compares them: any case, trailing dots and spaces dropped. */
