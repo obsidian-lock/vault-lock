@@ -23,8 +23,9 @@ computer.
 - **The backup leaves the private folder alone while locked**, so encrypted files never
   replace the readable copies on the server. A restore sent while locked writes the private
   files at the first backup run after the next unlock.
-- **Closing Obsidian waits for the encryption** (up to 20 seconds); anything left is
-  finished at the next start.
+- **Closing Obsidian encrypts first**, smallest files first, for as long as Obsidian lets
+  it (on Windows, Obsidian closes after about 3 seconds). Anything left stays in the hidden
+  folder and is finished at the next start.
 - **A lock during an unlock wins.** Locking, or closing Obsidian, while the passphrase is
   checked or the folder is being decrypted stops the unlock: the window stays locked and
   what was decrypted is encrypted again.
