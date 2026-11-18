@@ -3,6 +3,12 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.9.2 — 2026-11-18
+
+- **Obsidian opens maximized.** At each start the window fills the screen (the taskbar stays).
+  Not when it is already maximized or full screen, and only once per start, so a window you
+  make smaller stays that way until the next start.
+
 ## 1.9.1 — 2026-11-18
 
 - **The private folder is always there.** Before, the plugin hid a folder named `Private`

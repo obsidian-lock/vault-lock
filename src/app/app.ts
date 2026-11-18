@@ -9,6 +9,7 @@ import { Backup } from "./backup";
 import { LockScreen } from "./lock";
 import { PassphraseModal } from "./passphrase";
 import { renderSettings } from "./settingsTab";
+import { maximizeOnce } from "./window";
 
 /**
  * The app tier: lock screen, private folder, backup, pairing and the control channel. Built
@@ -63,6 +64,8 @@ export class VaultLockApp extends Component implements App {
 		// The same rules as styles.css, so an app.js from the server has its styles even when the file on disk is older.
 		const style = document.head.createEl("style", { text: css });
 		this.register(() => style.remove());
+		// Obsidian opens maximized (once per window; never throws).
+		maximizeOnce(() => this.stopping);
 
 		// Test builds only (scripts/build-tests.mjs); "" in releases, so these lines are dead code.
 		if (__VLB_FAULT__ === "throw-start") throw new Error("test fault: throw-start");

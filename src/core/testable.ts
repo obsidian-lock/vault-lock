@@ -6,3 +6,4 @@ export { readCoreState, writeCoreState, defaults, parseCoreConfig, CORE_FILE } f
 export { cmpVersion } from "../shared/version";
 export * from "../shared/vlenc";
 export { MIN_APP_VERSION } from "../shared/constants";
+export { maximizeOnce, MAXIMIZE_TRIES } from "../app/window";
