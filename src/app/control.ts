@@ -50,6 +50,8 @@ export type ReconcileSummary = { at: string; reason: string; files: number; uplo
 
 export class Control {
 	configError = "";
+	/** A restore (pull, restore-all or the deferred one) is writing into the vault: the app makes no private folder meanwhile. */
+	restoring = 0;
 	/** The last reconcile that completed since Obsidian started; null until the first one. */
 	lastReconcile: ReconcileSummary | null = null;
 	/** What the last look at vault-key.json found. "unsaved": the key arrived but data.json or data.bak.json could not be written. */
@@ -275,6 +277,7 @@ export class Control {
 		const n = { written: 0, refused: 0, deferred: 0 };
 		const clean = paths.filter((p): p is string => typeof p === "string").map((p) => p.replace(/^\/+|\/+$/g, "")).filter(Boolean);
 		this.wrotePrivate = false;
+		this.restoring++;
 		try {
 			for (const p of clean) {
 				const keys = m[p] ? [p] : Object.keys(m).filter((k) => k.startsWith(p + "/"));
@@ -282,6 +285,7 @@ export class Control {
 				for (const k of keys) this.tally(n, await this.writeFromServer(k, m[k], true), { id, cmd: "pull", paths: clean });
 			}
 		} finally {
+			this.restoring--;
 			await this.hideIfLocked();
 		}
 		return `${n.written} files written` + (n.refused ? `, ${n.refused} plugin files refused` : "") + deferredNote(n.deferred);
@@ -292,12 +296,14 @@ export class Control {
 		await this.backup.loadManifest();
 		const n = { written: 0, kept: 0, refused: 0, deferred: 0 };
 		this.wrotePrivate = false;
+		this.restoring++;
 		try {
 			for (const [sp, e] of Object.entries(this.backup.manifest)) {
 				if (!this.backup.enabled) throw new Error(`stopped (plugin reloaded or closed) after ${n.written} files; send restore-all again`);
 				this.tally(n, await this.writeFromServer(sp, e, false), { id, cmd: "restore-all" });
 			}
 		} finally {
+			this.restoring--;
 			await this.hideIfLocked();
 		}
 		return `${n.written} files written` + (n.kept ? `, ${n.kept} newer local files kept` : "") + (n.refused ? `, ${n.refused} plugin files refused` : "") + deferredNote(n.deferred);
@@ -341,6 +347,7 @@ export class Control {
 		if (!s.restoreDeferred.length || !pf.enabled) return;
 		if (await this.owner.app.vault.adapter.exists(pf.hiddenName)) return; // still locked: wait
 		this.wrotePrivate = false;
+		this.restoring++;
 		try {
 			for (const d of s.restoreDeferred.slice()) {
 				await this.backup.loadManifest();
@@ -370,6 +377,7 @@ export class Control {
 				}
 			}
 		} finally {
+			this.restoring--;
 			// A lock that landed during the run: what was written visible is hidden again.
 			await this.hideIfLocked();
 		}

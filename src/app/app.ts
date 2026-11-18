@@ -1,6 +1,7 @@
 import { Component } from "obsidian";
 import type { App as ObsidianApp, PluginManifest } from "obsidian";
 import css from "../../styles.css";
+import { PRIVATE_RECHECK_MS } from "../shared/constants";
 import { API, App, Host } from "../shared/contract";
 import { PrivateFolder } from "../shared/privateFolder";
 import type { VLBSettings } from "../shared/settings";
@@ -32,6 +33,13 @@ export class VaultLockApp extends Component implements App {
 	stopping = false;
 	private stopped: Promise<void> | null = null;
 	private lockedAtUnload = false;
+	/** Obsidian's layout is ready: the vault is loaded, so the private folder may be made. */
+	private layoutReady = false;
+	/** A check of the private folder waits on its chain (one is enough). */
+	private folderCheckQueued = false;
+	/** The private folder's name at the last check: a name just changed in the settings waits for the next one. */
+	private folderName: string;
+	private folderTimer: number | null = null;
 
 	constructor(readonly host: Host) {
 		super();
@@ -40,6 +48,7 @@ export class VaultLockApp extends Component implements App {
 		this.privateFolder = new PrivateFolder(host.app, () => host.settings);
 		this.lockScreen = new LockScreen(this);
 		this.backup = new Backup(this);
+		this.folderName = this.privateFolderName();
 	}
 
 	get settings(): VLBSettings {
@@ -65,13 +74,57 @@ export class VaultLockApp extends Component implements App {
 		if (this.lockScreen.hasPass && __VLB_FAULT__ !== "never-lock") await this.lockScreen.lock();
 		if (this.stopping) return;
 		this.lockScreen.install();
+		// The private folder deleted or renamed away while unlocked comes back within seconds. The
+		// events of the lock's own rename are no exception to make: the check finds the vault locked.
+		const gone = (p: string) => {
+			const name = this.privateFolderName();
+			if (!name || fold(p) !== fold(name)) return;
+			if (this.folderTimer !== null) window.clearTimeout(this.folderTimer);
+			this.folderTimer = window.setTimeout(() => { this.folderTimer = null; this.ensurePrivateFolder(); }, PRIVATE_RECHECK_MS);
+		};
+		this.registerEvent(this.app.vault.on("delete", (f) => gone(f.path)));
+		this.registerEvent(this.app.vault.on("rename", (_f, oldPath) => gone(oldPath)));
+		this.register(() => { if (this.folderTimer !== null) window.clearTimeout(this.folderTimer); });
 
 		this.app.workspace.onLayoutReady(() => {
 			if (this.stopping) return;
+			this.layoutReady = true;
 			this.backup.start();
+			// The private folder is there from the first start on, before a passphrase is chosen.
+			this.ensurePrivateFolder();
 			// First run: the passphrase is the one thing to set up. Asked again at every start until set.
 			if (!this.lockScreen.hasPass) new PassphraseModal(this).open();
 		});
+	}
+
+	/** The private folder always exists while unlocked (1.9.1). Asked once the layout is ready,
+	 *  after an unlock and after a passphrase is saved, every 15 s (the idle check) and soon after
+	 *  the folder was deleted or renamed away. Never while locked or unlocking, during a restore or
+	 *  once stopping: the lock's rename makes the folder disappear, and a folder made then would
+	 *  meet the hidden one coming back. The job runs on the private folder's chain and asks again
+	 *  right before it makes the folder; this never waits and never throws. */
+	ensurePrivateFolder(): void {
+		if (!this.layoutReady || this.folderCheckQueued || this.privateFolderBusy()) return;
+		const name = this.privateFolderName();
+		// A name being typed in the settings: only a name seen at two checks in a row is made.
+		if (name !== this.folderName) { this.folderName = name; return; }
+		if (!name) return;
+		this.folderCheckQueued = true;
+		void this.privateFolder.ensureVisible(() => this.privateFolderBusy()).finally(() => { this.folderCheckQueued = false; });
+	}
+
+	private privateFolderBusy(): boolean {
+		const ls = this.lockScreen;
+		return this.stopping || ls.locked || ls.unlocking || this.backup.control.restoring > 0;
+	}
+
+	/** The configured name when it is a usable one, else "". */
+	private privateFolderName(): string {
+		try {
+			return this.privateFolder.enabled ? this.privateFolder.name : "";
+		} catch {
+			return ""; // not a string in data.json
+		}
 	}
 
 	stop(): Promise<void> {
@@ -115,4 +168,9 @@ export class VaultLockApp extends Component implements App {
 	renderSettings(el: HTMLElement): void {
 		renderSettings(el, this.host, this);
 	}
+}
+
+/** Names as NTFS and APFS compare them. */
+function fold(n: string): string {
+	return n.normalize("NFC").toLowerCase();
 }

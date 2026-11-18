@@ -7,7 +7,9 @@
 // the stray merge, a stop at every step of a file's transformation, the read-back verify, the
 // pair rule, the kill switch, the lifeboat, the quit task, the deferred restore (also with a
 // lock landing mid-restore, a file gone from the server, a folder rename that keeps failing)
-// and one pass at a time. Plain Node, no dependencies, about 90 s (one case waits out the 30 s
+// and one pass at a time. Since 1.9.1 the private folder is made whenever it is missing while
+// unlocked, and never while locked or unlocking (case 25). Plain Node, no dependencies, about
+// 105 s (one case waits out the 30 s
 // rename retry, two wait for the 10 s hide retry). Run
 // after `npm run build` and `node scripts/build-tests.mjs` (npm test does both); exits
 // non-zero on the first failure.
@@ -67,6 +69,13 @@ const realLog = console.log;
 console.log = (...a) => {
 	consoleLines.push(a.map((x) => (typeof x === "string" ? x : String(x))).join(" "));
 	realLog(...a);
+};
+/** Every console.warn line (the private folder's "could not be made" and "not a folder"). Still printed. */
+const warnLines = [];
+const realWarn = console.warn;
+console.warn = (...a) => {
+	warnLines.push(a.map((x) => (typeof x === "string" ? x : String(x))).join(" "));
+	realWarn(...a);
 };
 
 // ---- hooks into the plugin's file operations --------------------------------------------
@@ -198,6 +207,7 @@ function freshDocument() {
 	globalThis.document = doc;
 	delete globalThis.__vaultLock;
 	delete globalThis.__vaultLockStopping;
+	ui = { fields: [], buttons: [] };
 	resetHooks();
 }
 
@@ -259,13 +269,20 @@ class Plugin extends Component {
 	}
 }
 
-function chain() {
+/** The text fields and buttons the plugin made through Setting (the passphrase dialog), so a
+ *  case can type and click: fields[i](value) is a field's onChange; buttons [{ text, click }]. */
+let ui = { fields: [], buttons: [] };
+function chain(kind = "") {
+	let label = "";
 	const p = new Proxy(function () {}, {
 		get(_, k) {
 			if (typeof k === "symbol" || k === "then") return undefined;
 			if (k === "inputEl" || k === "buttonEl" || k === "toggleEl") return el("input");
-			if (k.startsWith("add")) return (cb) => { if (typeof cb === "function") cb(chain()); return p; };
-			return () => p; // setName, setDesc, setValue, onChange, onClick, ...
+			if (k.startsWith("add")) return (cb) => { if (typeof cb === "function") cb(chain(k)); return p; };
+			if (k === "setButtonText") return (t) => { label = String(t); return p; };
+			if (k === "onClick") return (fn) => { ui.buttons.push({ text: label, click: fn }); return p; };
+			if (k === "onChange" && kind === "addText") return (fn) => { ui.fields.push(fn); return p; };
+			return () => p; // setName, setDesc, setValue, onChange, ...
 		},
 	});
 	return p;
@@ -419,14 +436,27 @@ function makeVault(data, coreJson) {
 	if (coreJson) fs.writeFileSync(path.join(base, PLUGIN_DIR, "core.json"), JSON.stringify(coreJson));
 	return { base, app: makeApp(base) };
 }
-/** Obsidian's app over a vault folder. workspace.on keeps the callbacks in handlers (the quit task). */
+/** Obsidian's app over a vault folder. workspace.on keeps the callbacks in handlers (the quit
+ *  task), vault.on in handlers["vault:" + name], onLayoutReady in handlers.layout. */
 function makeApp(base) {
 	const handlers = {};
+	const adapter = new FileSystemAdapter(base);
 	return {
 		handlers,
-		vault: { adapter: new FileSystemAdapter(base), configDir: ".obsidian", on: () => ({}) },
+		vault: {
+			adapter,
+			configDir: ".obsidian",
+			on: (name, cb) => { (handlers["vault:" + name] ??= []).push(cb); return {}; },
+			/** As Obsidian's: refuses a name that exists; hooks.adapter("createFolder") can fail it. */
+			async createFolder(p) {
+				await adapter.hook("createFolder", p);
+				fs.mkdirSync(adapter.getFullPath(p));
+				return Object.assign(new obsidian.TFolder(), { path: p });
+			},
+		},
 		workspace: {
-			onLayoutReady: () => {}, // layout never ready: no backup, no dialog, no ticks
+			// The layout is never ready unless a case calls layoutReady(app): no backup, no dialog, no ticks.
+			onLayoutReady: (cb) => { (handlers.layout ??= []).push(cb); },
 			on: (name, cb) => { (handlers[name] ??= []).push(cb); return {}; },
 			iterateAllLeaves: () => {},
 		},
@@ -687,6 +717,22 @@ function events(cur) {
 		rename: (p, old) => b.onRename(file(p), old),
 	};
 }
+/** Obsidian's layout becomes ready: the callbacks registered so far run (the backup starts, the first-run dialog opens). */
+function layoutReady(app) {
+	for (const cb of app.handlers.layout ?? []) cb();
+}
+/** A vault event about a folder, to every handler registered on app.vault ("delete": p; "rename": p new, old the old path). */
+function vaultEvent(app, name, p, old) {
+	const f = Object.assign(new obsidian.TFolder(), { path: p });
+	for (const cb of app.handlers["vault:" + name] ?? []) cb(f, old);
+}
+/** The entries at the top of the vault named like the private folder, visible or hidden, in any case. */
+const privateEntries = (base) => fs.readdirSync(base).filter((n) => /^\.?private$/i.test(n)).sort();
+/** Every private folder job queued so far (the vault's serial chain) is done. */
+const settled = (cur) => within(cur.privateFolder.tail(), 15_000, "the private folder's jobs");
+/** Longer than PRIVATE_RECHECK_MS: the check a delete or rename event asks for has run. */
+const RECHECK_WAIT = 1_400;
+
 /** Obsidian closing: every quit task is run (Tasks.add(fn) collects fn()) and waited for. */
 async function quit(app) {
 	const pending = [];
@@ -2872,6 +2918,191 @@ async function main() {
 		await unlockApp(cur);
 		sameSnap(snap(path.join(base, V_DIR)), orig, "after the unlock");
 		await stopPlugin(p);
+	}
+
+	// 25. 1.9.1: the private folder always exists while unlocked. Made (empty, through Obsidian)
+	// from the first start on, after an unlock, and again within seconds when it is deleted or
+	// renamed away; never while locked or unlocking (the lock's own rename events included),
+	// never beside a hidden folder, never over a file, never in another case.
+	step = "25 first start without a passphrase: the private folder is made";
+	{
+		server = fakeServer();
+		const { p, S, base, app } = await startPlugin(VaultLockPlugin, { ...LOGIN }, null, { before: (b) => fs.rmSync(path.join(b, V_DIR), { recursive: true }) });
+		const cur = S.current;
+		const V = path.join(base, V_DIR), H = path.join(base, H_DIR);
+		check(!cur.locked() && !fs.existsSync(V), "not an unlocked vault without a private folder");
+		cur.lockScreen.checkIdle();
+		await settled(cur);
+		check(!fs.existsSync(V), "the private folder was made before Obsidian's layout was ready");
+		layoutReady(app);
+		await waitFor(() => fs.existsSync(V), 5_000, "the private folder at the first start");
+		check(!p.settings.passHash, "a passphrase is set already");
+		const save = ui.buttons.find((b) => b.text === "Save");
+		check(save && ui.fields.length === 2, "the first-run dialog did not open: " + JSON.stringify(ui.buttons.map((b) => b.text)));
+		check(fs.statSync(V).isDirectory() && listFiles(V).length === 0 && privateEntries(base).join() === "Private", "not one empty Private/: " + privateEntries(base));
+		check(consoleLines.some((l) => /the private folder Private\/ was missing and has been made/.test(l)), "no log line for the made folder");
+
+		step = "25 the first passphrase: still exactly one private folder";
+		ui.fields[0]("right");
+		ui.fields[1]("right");
+		save.click();
+		await waitFor(() => { try { return !!readData(base, "data.bak.json").passHash; } catch { return false; } }, 10_000, "the first passphrase saved");
+		await macrotask();
+		await settled(cur);
+		check(!cur.locked() && privateEntries(base).join() === "Private" && listFiles(V).length === 0, "after the first passphrase: " + privateEntries(base));
+
+		step = "25 deleted while unlocked: back within seconds";
+		fs.writeFileSync(path.join(V, "Gone.md"), "gone");
+		fs.rmSync(V, { recursive: true });
+		vaultEvent(app, "delete", V_DIR);
+		await waitFor(() => fs.existsSync(V), 5_000, "the deleted private folder made again");
+		check(listFiles(V).length === 0 && privateEntries(base).join() === "Private", "not one empty Private/ after the delete: " + privateEntries(base));
+
+		step = "25 renamed away while unlocked: a new empty one, the renamed one untouched";
+		fs.writeFileSync(path.join(V, "Kept.md"), "kept");
+		const before = snap(V);
+		fs.renameSync(V, path.join(base, "Notes"));
+		vaultEvent(app, "rename", "Notes", V_DIR);
+		await waitFor(() => fs.existsSync(V), 5_000, "the renamed-away private folder made again");
+		check(listFiles(V).length === 0, "the new private folder is not empty: " + listFiles(V));
+		sameSnap(snap(path.join(base, "Notes")), before, "the renamed folder");
+
+		step = "25 lock: hidden, and not made again by the lock's own events";
+		fs.writeFileSync(path.join(V, "Secret.md"), "secret");
+		fs.mkdirSync(path.join(V, "Sub"));
+		fs.writeFileSync(path.join(V, "Sub", "Deep.md"), "deep");
+		const orig = snap(V);
+		let atHide = 0;
+		hooks.folderRenamed = (dir) => {
+			if (dir !== "hide") return;
+			atHide++;
+			// Obsidian reports the rename as a delete; and every other road to a check, at that very moment.
+			vaultEvent(app, "delete", V_DIR);
+			cur.ensurePrivateFolder();
+			cur.lockScreen.checkIdle();
+			void cur.privateFolder.ensureVisible(() => false); // even with no flag set: queued behind the hide, it finds .Private/
+		};
+		await within(cur.lock(), 10_000, "the lock");
+		check(atHide === 1, "the lock did not rename the private folder");
+		vaultEvent(app, "delete", V_DIR);
+		await sleep(RECHECK_WAIT);
+		cur.lockScreen.checkIdle();
+		cur.ensurePrivateFolder();
+		await within(cur.finishLock(), 20_000, "finishLock");
+		await settled(cur);
+		check(cur.locked() && !fs.existsSync(V) && privateEntries(base).join() === ".Private", "after the lock: " + privateEntries(base));
+		sameSnap(snap(H), orig, "the hidden folder (no key: hidden only)");
+
+		step = "25 unlock: exactly one Private/ with the notes";
+		resetHooks();
+		const logAt = consoleLines.length;
+		let atShow = 0;
+		hooks.adapter = (name, a) => {
+			if (name === "rename" && folderRename(a[0], a[1]) === "show" && atShow++ === 0) {
+				// Right before the rename back: .Private/ is there, Private/ is not.
+				vaultEvent(app, "delete", V_DIR);
+				cur.ensurePrivateFolder();
+				cur.lockScreen.checkIdle();
+				void cur.privateFolder.ensureVisible(() => false);
+			}
+			return 0;
+		};
+		await unlockApp(cur);
+		check(atShow === 1, "the unlock did not rename the folder back");
+		await sleep(RECHECK_WAIT);
+		cur.lockScreen.checkIdle();
+		await settled(cur);
+		resetHooks();
+		check(privateEntries(base).join() === "Private", "after the unlock: " + privateEntries(base));
+		sameSnap(snap(V), orig, "the private folder after the unlock");
+		check(!listFiles(V).some((r) => /created while locked/.test(r)) && !consoleLines.slice(logAt).some((l) => /moved into the private folder/.test(l)), "a stray merge ran: " + listFiles(V));
+
+		step = "25 a FILE named like the private folder: nothing made, said once";
+		fs.renameSync(V, path.join(base, "Notes2"));
+		fs.writeFileSync(path.join(base, V_DIR), "a file, not a folder");
+		const warnAt = warnLines.length;
+		vaultEvent(app, "rename", "Notes2", V_DIR);
+		await sleep(RECHECK_WAIT);
+		await settled(cur);
+		cur.lockScreen.checkIdle();
+		await settled(cur);
+		check(fs.statSync(V).isFile() && privateEntries(base).join() === "Private", "the file was replaced: " + privateEntries(base));
+		const said = warnLines.slice(warnAt).filter((l) => /not a folder/.test(l));
+		check(said.length === 1, "the file was not reported exactly once: " + JSON.stringify(warnLines.slice(warnAt)));
+		fs.rmSync(V);
+
+		step = "25 another case, or the hidden folder already there: nothing made";
+		for (const other of ["private", H_DIR]) {
+			fs.mkdirSync(path.join(base, other));
+			fs.writeFileSync(path.join(base, other, "Mine.md"), "mine");
+			cur.ensurePrivateFolder();
+			await settled(cur);
+			cur.lockScreen.checkIdle();
+			await settled(cur);
+			check(privateEntries(base).join() === other && listFiles(path.join(base, other)).join() === "Mine.md", `with ${other}/ there: ` + privateEntries(base));
+			fs.rmSync(path.join(base, other), { recursive: true });
+		}
+
+		step = "25 unlock with the private folder missing: made";
+		check(privateEntries(base).length === 0, "the test vault is not empty of private folders: " + privateEntries(base));
+		await within(cur.lock(), 10_000, "the lock without a private folder");
+		check(cur.locked() && privateEntries(base).length === 0, "the lock made a folder: " + privateEntries(base));
+		await unlockApp(cur, "unlock without a private folder");
+		await settled(cur);
+		check(fs.statSync(V).isDirectory() && listFiles(V).length === 0 && privateEntries(base).join() === "Private", "after the unlock: " + privateEntries(base));
+
+		step = "25 createFolder fails: the unlock still succeeds, made at the next check";
+		fs.rmSync(V, { recursive: true });
+		await within(cur.lock(), 10_000, "the lock");
+		let refused = 0;
+		hooks.adapter = (name) => { if (name === "createFolder" && refused++ === 0) throw new Error("EACCES: permission denied (test)"); return 0; };
+		const warnAt2 = warnLines.length;
+		await unlockApp(cur, "unlock while making the folder fails");
+		await settled(cur);
+		check(refused === 1 && !fs.existsSync(V), "the failing createFolder was not tried: " + refused);
+		check(warnLines.slice(warnAt2).some((l) => /\[VLB\] the private folder could not be made/.test(l)), "the failure was not logged");
+		cur.lockScreen.checkIdle();
+		await settled(cur);
+		check(fs.existsSync(V) && privateEntries(base).join() === "Private", "not made at the next check: " + privateEntries(base));
+		resetHooks();
+		await stopPlugin(p);
+		server = null;
+	}
+
+	step = "25 a 1.9.0 data.json, with and without a private folder";
+	{
+		const DATA_190 = {
+			...REAL_PASS, passCopied: "", idleMinutes: 5, lockOnBlur: false, privateFolder: "Private", ...LOGIN, reconcileMinutes: 10,
+			excludes: ".trash/\n.obsidian/workspace", doneCommands: [], commandLog: {}, vaultKey: { id: KEY.id, key: KEY.key }, encrypt: true, restoreDeferred: [],
+		};
+		for (const withFolder of [true, false]) {
+			server = fakeServer();
+			let orig = null;
+			const { p, S, base, app } = await startPlugin(VaultLockPlugin, DATA_190, null, { before: (b) => {
+				if (withFolder) orig = snap(path.join(b, V_DIR));
+				else fs.rmSync(path.join(b, V_DIR), { recursive: true });
+			} });
+			const cur = S.current;
+			const V = path.join(base, V_DIR);
+			layoutReady(app);
+			// Obsidian reports the start's rename as a delete, after the layout is ready.
+			vaultEvent(app, "delete", V_DIR);
+			await within(cur.finishLock(), 20_000, "finishLock");
+			await sleep(RECHECK_WAIT);
+			cur.lockScreen.checkIdle();
+			await settled(cur);
+			check(cur.locked() && !fs.existsSync(V), `${withFolder ? "with" : "without"} a folder: Private/ there while locked`);
+			if (withFolder) encryptedOnDisk(base, ["Secret.md"], "the 1.9.0 vault locked");
+			else check(privateEntries(base).length === 0, "a folder was made while locked: " + privateEntries(base));
+			await unlockApp(cur);
+			await settled(cur);
+			check(privateEntries(base).join() === "Private", "after the unlock: " + privateEntries(base));
+			if (withFolder) sameSnap(snap(V), orig, "the 1.9.0 vault's private folder after the unlock");
+			else check(listFiles(V).length === 0, "the new private folder is not empty: " + listFiles(V));
+			check(Object.keys(readData(base)).sort().join() === Object.keys(DATA_190).sort().join(), "data.json has new or missing keys: " + Object.keys(readData(base)).sort());
+			await stopPlugin(p);
+			server = null;
+		}
 	}
 
 	// 7. Nothing touched the network outside the steps with a server.

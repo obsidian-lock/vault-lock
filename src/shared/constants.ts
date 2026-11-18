@@ -51,6 +51,10 @@ export const HIDE_RETRY_MS = 10_000;
 export const BUSY_RETRY_MS = 60_000;
 /** The quit task waits this long for the background encryption. */
 export const QUIT_WAIT_MS = 20_000;
+/** The private folder deleted or renamed away while unlocked is made again this long after the event. */
+export const PRIVATE_RECHECK_MS = 1_000;
+/** Making the missing private folder may hold the private folder's job chain this long at most. */
+export const CREATE_FOLDER_MS = 10_000;
 /** Bigger files are hidden, not encrypted, and reported. */
 export const MAX_ENCRYPT_BYTES = MAX_BYTES;
 /** The core refuses a server bundle (either slot) older than this: that code would move the

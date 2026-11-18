@@ -3,6 +3,18 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 1.9.1 — 2026-11-18
+
+- **The private folder is always there.** Before, the plugin hid a folder named `Private`
+  only if you had made one yourself, so a new vault had nothing private. Now the plugin
+  makes an empty `Private` folder by itself: at the first start (before you choose a
+  passphrase), after an unlock, and again within a few seconds if it is deleted or renamed
+  away while the vault is unlocked. Put the notes you want hidden and encrypted into it.
+- It is never made while the vault is locked or being unlocked, and never when a folder of
+  that name already exists in any form (another upper/lower case, or the hidden one), or a
+  file has that name. Nothing to set on the computer.
+- The setting is now called "Folder hidden while locked", without the long explanation.
+
 ## 1.9.0 — 2026-11-16
 
 The private folder is now encrypted on disk while the vault is locked. Nothing to set on the

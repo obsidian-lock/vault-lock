@@ -34,8 +34,7 @@ export function renderSettings(el: HTMLElement, host: Host, owner: VaultLockApp)
 		.addToggle((t) => t.setValue(s.lockOnBlur).onChange(async (v) => { s.lockOnBlur = v; await host.saveSettings(); }));
 
 	new Setting(el)
-		.setName("Private folder")
-		.setDesc("Top-level folder that is renamed to a dot-folder (invisible to Obsidian) while locked. Change it only while unlocked.")
+		.setName("Folder hidden while locked")
 		.addText((t) => t.setValue(s.privateFolder).onChange(async (v) => {
 			const name = v.trim();
 			if (name.includes("/") || name.startsWith(".")) return;

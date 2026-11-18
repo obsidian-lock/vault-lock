@@ -61,6 +61,7 @@ export class PassphraseModal extends Modal {
 				this.busy = false;
 			}
 			new Notice(changing ? "Passphrase changed." : "Passphrase saved. Don't forget it: you need it to unlock this vault.", 8000);
+			this.owner.ensurePrivateFolder();
 			this.close();
 			this.onSaved?.();
 		};

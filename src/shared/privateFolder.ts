@@ -3,7 +3,7 @@ import type { App } from "obsidian";
 import * as fs from "fs";
 import * as path from "path";
 import {
-	BUSY_RETRY_MS, ENC_PAUSE_MS, FS_RETRY_MS, FS_RETRY_STEP_MS, MAX_ENCRYPT_BYTES, RENAME_RETRY_MS, RENAME_RETRY_STEP_MS, SHOW_RENAME_RETRY_MS,
+	BUSY_RETRY_MS, CREATE_FOLDER_MS, ENC_PAUSE_MS, FS_RETRY_MS, FS_RETRY_STEP_MS, MAX_ENCRYPT_BYTES, RENAME_RETRY_MS, RENAME_RETRY_STEP_MS, SHOW_RENAME_RETRY_MS,
 } from "./constants";
 import type { VLBSettings } from "./settings";
 import { stamp } from "./vaultfiles";
@@ -75,6 +75,8 @@ export class PrivateFolder {
 	private recovered = 0;
 	private hideError: string | null = null;
 	private lastPass: EncStats["lastPass"] = null;
+	/** The last warning of ensureVisible(), so a check every 15 s does not repeat it. */
+	private lastWarn = "";
 
 	constructor(private app: App, private settings: () => VLBSettings) {
 		// A key loaded from disk is durable by definition (the core validated it).
@@ -224,6 +226,40 @@ export class PrivateFolder {
 			await (t ?? Promise.resolve()).catch(() => {});
 			if (chains[key] === t && !this.queued && !this.prePause) return;
 		}
+	}
+
+	/** The private folder always exists while unlocked (1.9.1; the app asks, the lifeboat never
+	 *  does). Made empty, through Obsidian so the file list shows it at once, only when the top of
+	 *  the vault holds it in no form: neither the visible nor the hidden name, in any case (NTFS
+	 *  and APFS ignore case), and no file by that name. A job on the serial chain, so it never runs
+	 *  during a hide, a show or a pass of any copy of the plugin; cancelled() (locked, unlocking, a
+	 *  restore, stopping) is asked as it starts and again right before the folder is made. Never
+	 *  rejects: a failure is logged once and the next check tries again. */
+	ensureVisible(cancelled: () => boolean): Promise<void> {
+		return this.serial(async () => {
+			if (this.disposed || !this.enabled || cancelled()) return;
+			const adapter = this.app.vault.adapter as FileSystemAdapter;
+			if (typeof adapter.getBasePath !== "function") return; // not on a local disk
+			const fold = (n: string) => n.normalize("NFC").toLowerCase();
+			const V = this.name;
+			const names = new Set([fold(V), fold(this.hiddenName)]);
+			const top = await fsp.readdir(path.toNamespacedPath(adapter.getBasePath()), { withFileTypes: true });
+			const there = top.find((e) => names.has(fold(e.name)));
+			if (there) {
+				if (!there.isDirectory()) this.warnOnce(`"${there.name}" at the top of the vault is not a folder; no private folder is made`);
+				return;
+			}
+			if (this.disposed || cancelled()) return;
+			await bounded(this.app.vault.createFolder(V), CREATE_FOLDER_MS, `making ${V}/`);
+			this.lastWarn = "";
+			console.log(`[VLB] the private folder ${V}/ was missing and has been made`);
+		}).catch((e) => this.warnOnce(`the private folder could not be made (tried again at the next check): ${msg(e)}`));
+	}
+
+	private warnOnce(text: string): void {
+		if (text === this.lastWarn) return;
+		this.lastWarn = text;
+		console.warn("[VLB] " + text);
 	}
 
 	/** Encrypt a hidden folder now (the key arrived, or encryption was turned on). */
@@ -947,6 +983,13 @@ function msg(e: unknown): string {
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms));
+}
+
+/** p, or a rejection after ms: a job that hangs must not hold up the chain (and so a lock) for good. */
+function bounded<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+	let t: ReturnType<typeof setTimeout> | undefined;
+	const limit = new Promise<never>((_, reject) => { t = setTimeout(() => reject(new Error(`${what}: not done in ${Math.round(ms / 1000)} s`)), ms); });
+	return Promise.race([p, limit]).finally(() => clearTimeout(t));
 }
 
 /** Run Windows' attrib.exe without a console window. Never rejects. */

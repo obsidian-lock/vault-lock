@@ -75,6 +75,8 @@ export class LockScreen {
 	}
 
 	private checkIdle(): void {
+		// The private folder's safety net (the vault events are the quick road); a no-op while locked.
+		this.owner.ensurePrivateFolder();
 		const m = this.owner.settings.idleMinutes;
 		if (!this.hasPass || this.locked || m <= 0) return;
 		if (Date.now() - this.lastActivity >= m * 60_000) void this.lock();
@@ -190,6 +192,8 @@ export class LockScreen {
 		this.locked = false;
 		this.lastActivity = Date.now();
 		this.removeOverlay(true);
+		// No private folder came back (there was none, or it was removed while locked): a new, empty one.
+		this.owner.ensurePrivateFolder();
 		// Runs a deferred restore within seconds.
 		this.owner.backup.requestReconcile("unlock");
 		return true;
