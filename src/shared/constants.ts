@@ -1,5 +1,5 @@
 /** The core's contract level; server bundles carry the lowest one they need (minCore). */
-export const CORE_VERSION = 2;
+export const CORE_VERSION = 3;
 /** App.start() must resolve within this. */
 export const START_TIMEOUT_MS = 30_000;
 /** App.stop() is awaited at most this long. */
@@ -12,7 +12,7 @@ export const BAD_RETRY_MS = 86_400_000;
 export const TICK_MS = 600_000;
 /** First core tick, after the layout is ready. */
 export const FIRST_TICK_MS = 60_000;
-/** Switch to a waiting choice once the vault is locked. */
+/** Switch to a waiting choice once nothing private is exposed. */
 export const ACTIVATE_MS = 30_000;
 /** The second successful write probe must come at least this long after the first. */
 export const PROBE_GAP_MS = 540_000;

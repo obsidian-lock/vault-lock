@@ -15,6 +15,9 @@ import { CONTROL, excluded, Index, LocalFile, MANIFEST, parentOf, scan } from ".
  * files removed here stay in the index until the full app takes over and trashes them.
  * No pairing, no commands, no config, no passphrase copy. Inline styles only.
  *
+ * Unlike the full app, it keeps the 1.x whole-window lock: while locked an overlay covers the
+ * window and takes every key (the simplest safe fallback). Its overlay is its unlock dialog.
+ *
  * The private folder: hidden and encrypted while locked when data.json already holds the key
  * (the lifeboat never fetches one), hidden only otherwise; every unlock decrypts. Its backup
  * never lists the hidden folder, skips the visible one while it is hidden or while a restore
@@ -53,6 +56,7 @@ export class Lifeboat extends Component implements App {
 	private lockedAtUnload = false;
 	private overlay: HTMLElement | null = null;
 	private err: HTMLElement | null = null;
+	private input: HTMLInputElement | null = null;
 	private scope: Scope | null = null;
 	private titleGuard: { saved: string; observer: MutationObserver | null } | null = null;
 	private lastActivity = Date.now();
@@ -81,6 +85,8 @@ export class Lifeboat extends Component implements App {
 			this.lockNow();
 			// Resolves after the rename; the encryption goes on in the background.
 			await this.hideNow();
+		} else {
+			this.host.lockState(false);
 		}
 		if (this.stopping) return;
 		const touch = () => { this.lastActivity = Date.now(); };
@@ -168,6 +174,12 @@ export class Lifeboat extends Component implements App {
 		}, HIDE_RETRY_MS);
 	}
 
+	/** The overlay is the unlock dialog: the padlock or the command only puts the cursor in it. */
+	unlock(): Promise<void> {
+		if (this.isLocked) this.input?.focus();
+		return Promise.resolve();
+	}
+
 	finishLock(): Promise<void> {
 		return this.pf.finishLock();
 	}
@@ -190,6 +202,7 @@ export class Lifeboat extends Component implements App {
 
 	private lockNow(): void {
 		this.isLocked = true;
+		this.host.lockState(true);
 		if (!this.titleGuard) {
 			const g = { saved: document.title === TITLE ? "" : document.title, observer: null as MutationObserver | null };
 			try {
@@ -232,6 +245,7 @@ export class Lifeboat extends Component implements App {
 		document.body.appendChild(o);
 		this.overlay = o;
 		this.err = err;
+		this.input = input;
 
 		let pending = false;
 		const submit = async () => {
@@ -268,7 +282,8 @@ export class Lifeboat extends Component implements App {
 			await new Promise((r) => setTimeout(r, Math.min(5000, 500 * this.attempts)));
 			return false;
 		}
-		if (this.stopping) return false;
+		// Being stopped (a switch): the next app takes over; the passphrase was right, so the box says why it stays locked.
+		if (this.stopping) { if (this.err) this.err.textContent = "Vault Lock is restarting; try again in a moment."; return true; }
 		this.attempts = 0;
 		// A lock asked for while the passphrase was checked wins: nothing is opened (B15).
 		if (this.lockRequested) { if (this.err) this.err.textContent = "Locked again."; return true; }
@@ -294,6 +309,7 @@ export class Lifeboat extends Component implements App {
 		this.unlocking = false;
 		if (!done) return true; // stays locked; the error line says why
 		this.isLocked = false;
+		this.host.lockState(false);
 		this.lastActivity = Date.now();
 		this.removeOverlay(true);
 		return true;
@@ -308,6 +324,7 @@ export class Lifeboat extends Component implements App {
 		this.overlay?.remove();
 		this.overlay = null;
 		this.err = null;
+		this.input = null;
 		if (restoreTitle && g?.saved) document.title = g.saved;
 	}
 

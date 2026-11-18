@@ -30,6 +30,9 @@ export interface VLBSettings {
 	encrypt: boolean;
 	/** Restores that still owe their private files (see DeferredRestore). */
 	restoreDeferred: DeferredRestore[];
+	/** Where notes moved into the private folder came from (a folder ends in "/"): File
+	 *  recovery keeps their snapshots under the old path, so those go at the next lock. */
+	recoveryPaths: string[];
 }
 
 export const DEFAULT_SETTINGS: VLBSettings = {
@@ -49,4 +52,5 @@ export const DEFAULT_SETTINGS: VLBSettings = {
 	vaultKey: null,
 	encrypt: true,
 	restoreDeferred: [],
+	recoveryPaths: [],
 };

@@ -1,14 +1,16 @@
 /**
- * The core's fail-closed cover: an opaque layer over the whole window while no app has
- * locked the vault yet (at start, during a switch, during a reload). Inline styles only, so
+ * The core's fail-closed cover: an opaque layer over the whole window while the private folder
+ * is visible and no app has hidden it yet (at start, during a switch, during a reload). A
+ * hidden folder gets no cover: the rest of the vault stays usable. Inline styles only, so
  * it works without styles.css. While it is up, every key is swallowed and the window title is
  * kept at "Obsidian" (Obsidian rewrites it to the note's name at times). Obsidian's hotkeys
  * run in a window capture listener, before the swallow: an empty Scope on top of its keymap
  * (as the lock screens push) stops those.
  *
- * The cover never puts a note title back when it comes down: then a lock screen is up (which
- * restores the title itself on unlock) or there is no passphrase. Only a cover that removes
- * itself after a real disable restores the last title Obsidian asked for.
+ * The cover never puts a note title back when it comes down (the last title may name a
+ * private note): the folder is hidden now, or the fallback lock screen is up, or there is no
+ * passphrase. Only a cover that removes itself after a real disable restores the last title
+ * Obsidian asked for.
  */
 
 import { Scope } from "obsidian";
@@ -79,8 +81,15 @@ export class Cover {
 		document.title = TITLE;
 	}
 
-	/** The title stays as it is: a lock screen is up now (or there is no passphrase). */
+	/** The title stays as it is (see above). A cover the copy before left behind and nobody took
+	 *  over (it covered a folder that is hidden now) goes with it. */
 	hide(): void {
+		const left = window.__vaultLock?.cover;
+		if (left) {
+			window.clearTimeout(left.timer);
+			delete window.__vaultLock?.cover;
+			remove(left.el, left.swallow, left.guard ?? null, left.scope ?? null, false);
+		}
 		if (!this.el || !this.swallow) return;
 		remove(this.el, this.swallow, this.guard, this.scope, false);
 		this.el = null;

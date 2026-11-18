@@ -18,14 +18,15 @@ import { Updater } from "./updater";
 /**
  * Runs one app at a time and keeps the backup going whatever happens to it:
  * - at start it picks an app (loader.pick) and starts it with a time limit; one that throws,
- *   hangs, or leaves the vault unlocked is marked bad and the next one is tried, down to the
- *   lifeboat. The cover stays up until an app has locked the vault (fail closed);
+ *   hangs, or leaves something private exposed is marked bad and the next one is tried, down
+ *   to the lifeboat. While the private folder is visible, the cover stays up until an app has
+ *   hidden it (fail closed); a hidden folder needs no cover;
  * - core.json remembers an app that was starting when Obsidian died (crash loop: twice and
  *   it is skipped for 24 h);
  * - every 10 minutes the core tick reads the server's settings for the core (safe mode,
  *   watchdog), fetches signed plugin code from the server (updater.ts), runs the watchdog,
- *   and picks again; a different choice is switched to at the next lock (or at once when the
- *   lifeboat or a sick app runs, safe mode is ordered, or no passphrase is set);
+ *   and picks again; a different choice is switched to once nothing private is exposed (or
+ *   at once when the lifeboat or a sick app runs, safe mode is ordered, or no passphrase is set);
  * - a server bundle is read from disk and verified again (signature, sha256) every time it is
  *   considered, and evaluated only from the bytes just verified;
  * - the watchdog: when no backup run has finished for the threshold while the server
@@ -44,7 +45,7 @@ export class Supervisor {
 	/** The running app (test handle: current.lockScreen, .backup, .privateFolder; the lifeboat's run()). */
 	current: App | null = null;
 	running: RunningInfo | null = null;
-	/** A different choice found by a tick, waiting for the next lock. */
+	/** A different choice found by a tick, waiting until nothing private is exposed. */
 	pending: Pick | null = null;
 	/** Public for tests: set back in time to make the watchdog look. */
 	lastHeartbeat = 0;
@@ -117,7 +118,7 @@ export class Supervisor {
 			if (await this.startCandidate(choice)) return;
 		}
 		if (this.current || this.closed) return;
-		console.error("[VLB] no app could start; the vault stays covered; trying again in a minute");
+		console.error("[VLB] no app could start; trying again in a minute (a visible private folder stays covered)");
 		this.retryTimer = window.setTimeout(() => void this.startBest(), RETRY_START_MS);
 	}
 
@@ -156,7 +157,7 @@ export class Supervisor {
 		this.lastHeartbeat = this.startedAt = Date.now();
 		this.lastProbeOkAt = null;
 		if (this.state.sick && this.state.sick.id !== c.id) { this.state.sick = null; this.save(); }
-		// Only now: with a passphrase, the vault is locked under the cover.
+		// Only now: with a passphrase, nothing private is exposed under the cover.
 		this.cover.hide();
 		window.clearTimeout(this.successTimer);
 		if (!lifeboat) this.successTimer = window.setTimeout(() => this.markGood(c.id), SUCCESS_MS);
@@ -254,7 +255,9 @@ export class Supervisor {
 	private async doSwitch(choice: Choice, why: string): Promise<void> {
 		if (this.closed) return;
 		console.log(`[VLB] switching from ${this.running?.id ?? "nothing"} to ${choice} (${why})`);
-		if (this.plugin.hasPass) this.cover.show();
+		// A hidden folder stays hidden through the switch (the next app keeps it so); a visible
+		// one is covered until the next app has hidden it.
+		if (this.plugin.hasPass && this.plugin.privateVisible()) this.cover.show();
 		// It started fine and is being replaced, not crashing: no crash count at the next start.
 		const st = this.state.starting;
 		if (st && st.id === this.running?.id) { this.state.starting = null; this.save(); }
@@ -282,7 +285,7 @@ export class Supervisor {
 		}, FIRST_TICK_MS);
 	}
 
-	/** C.6: switch to a waiting choice once the vault is locked (or there is no passphrase). */
+	/** C.6: switch to a waiting choice once nothing private is exposed (or there is no passphrase). */
 	activationTick(): void {
 		if (this.closed || this.switching || !this.pending || !this.current) return;
 		let locked = false;
@@ -408,7 +411,7 @@ export class Supervisor {
 
 	// ---- stop ------------------------------------------------------------------------
 
-	/** Locked now? A lock screen that cannot answer counts as locked. */
+	/** Nothing private exposed now? An app that cannot answer counts as locked. */
 	lockedNow(): boolean {
 		try {
 			return this.current?.locked() ?? false;
@@ -478,6 +481,11 @@ export class Supervisor {
 		if (h === this.host || h === this.inflight?.host) this.lastHeartbeat = Date.now();
 	}
 
+	/** The padlock follows only the app that runs (or is starting), never one stopped or stopping. */
+	lockState(h: HostImpl, locked: boolean): void {
+		if (h === this.host || h === this.inflight?.host) this.plugin.setRibbon(locked);
+	}
+
 	coreStatus(): CoreStatus {
 		const r = this.running;
 		const st = this.state;
@@ -537,6 +545,9 @@ export class HostImpl implements Host {
 	}
 	heartbeat(): void {
 		this.sup.beat(this);
+	}
+	lockState(locked: boolean): void {
+		this.sup.lockState(this, locked);
 	}
 	/** Says what this host was made for, also while its app is still starting. */
 	coreStatus(): CoreStatus {

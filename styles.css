@@ -1,4 +1,4 @@
-/* Lock overlay */
+/* Fallback overlay: only when the private folder could not be hidden */
 .vlb-overlay {
 	position: fixed;
 	inset: 0;
@@ -33,7 +33,17 @@
 	text-align: center;
 }
 
-/* While locked, nothing underneath is painted (no peeking via transparency tricks). */
+/* Unlock dialog (the padlock) */
+.vlb-unlock .vlb-error {
+	margin-top: 8px;
+	text-align: left;
+}
+/* "Unlocking… n of N" in the error line, not in the error colour */
+.vlb-error.vlb-progress {
+	color: var(--text-muted);
+}
+
+/* Under the fallback overlay, nothing underneath is painted (no peeking via transparency tricks). */
 .vlb-locked .workspace,
 .vlb-locked .status-bar,
 .vlb-locked .modal-container,

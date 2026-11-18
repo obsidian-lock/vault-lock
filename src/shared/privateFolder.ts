@@ -17,6 +17,13 @@ import { decryptBytes, fault, importVaultKey, isAsideName, isTmpName, isVlencNam
  * encrypted to `<name>.vlenc` (shared/vlenc.ts) with the key the server made for this computer;
  * the unlock decrypts them before the folder comes back.
  *
+ * Every rename into the hidden folder (the folder at a lock, each stray move) goes through Node's
+ * fs, then Obsidian is told the old path is gone (adapter.update). Obsidian's own adapter.rename
+ * would announce every file under the hidden name first: links, bookmarks and tab history would
+ * follow them there, and a link click could open a note from the hidden folder. This way Obsidian
+ * only ever sees a delete of Private/…. The way back stays adapter.rename: Obsidian knows nothing
+ * under the hidden name, so it announces nothing, and its file watcher lists Private/ again.
+ *
  * Rules that keep every note (the invariants of the design doc):
  * - a plaintext is unlinked only after its .vlenc was written, fsynced, read back, decrypted
  *   and compared; a .vlenc only after its plaintext was written the same way, or when an
@@ -51,6 +58,9 @@ export class PrivateFolder {
 	keyDurable: boolean;
 	/** Test hook: how many encrypt passes ran. */
 	__passes = 0;
+	/** The visible folder's name as the disk spelled it at the last hide ("private" made by hand is
+	 *  the same folder as "Private" on Windows and macOS, and Obsidian lists it that way). */
+	lastVisibleName: string | null = null;
 
 	private gen = 0;
 	private queued = false;
@@ -111,6 +121,16 @@ export class PrivateFolder {
 		return null;
 	}
 
+	/** Private/ is on disk (unlocked, a failed lock, or strays). Sync; true when it cannot be checked. */
+	visibleOnDisk(): boolean {
+		if (!this.enabled) return false;
+		try {
+			return fs.existsSync(this.abs(this.name));
+		} catch {
+			return true;
+		}
+	}
+
 	/** V, V/…, H or H/… (folders arrive from scan() with a trailing "/"). */
 	isPrivatePath(p: string): boolean {
 		return this.enabled && (under(p, this.name) || under(p, this.hiddenName));
@@ -154,11 +174,12 @@ export class PrivateFolder {
 		return this.serial(async () => {
 			if (!this.enabled) return;
 			const adapter = this.app.vault.adapter;
-			const V = this.name, H = this.hiddenName;
+			const V = await this.diskName(), H = this.hiddenName;
 			try {
 				if (await adapter.exists(V)) {
+					this.lastVisibleName = V;
 					if (await adapter.exists(H)) {
-						const left = await this.mergeVisibleIntoHidden();
+						const left = await this.mergeVisibleIntoHidden(V);
 						if (left) throw new Error(`${left} file(s) could not be moved out of ${V}: ${this.strayFailed.join("; ")}`);
 					} else {
 						await this.closeLeavesUnder(V);
@@ -195,7 +216,7 @@ export class PrivateFolder {
 				// Unmark first, while Obsidian still ignores the dot-folder and sees no changes.
 				await this.setWindowsHidden(H, false, true);
 				if (await adapter.exists(V)) {
-					const left = await this.mergeVisibleIntoHidden();
+					const left = await this.mergeVisibleIntoHidden(await this.diskName());
 					if (left) throw new Error(`${left} file(s) in ${V} could not be moved into the private folder: ${this.strayFailed.join("; ")}`);
 				}
 				await this.decryptAll(cancelled);
@@ -670,10 +691,11 @@ export class PrivateFolder {
 	// ---- strays (C.9) ------------------------------------------------------------------------
 
 	/** A link clicked while locked makes V/x beside H/: move every such file into H/ under a
-	 *  free name. Returns how many could not be moved (they are reported and stay in V). */
-	private async mergeVisibleIntoHidden(): Promise<number> {
+	 *  free name. V is the visible folder as the disk spells it. Returns how many could not be
+	 *  moved (they are reported and stay in V). */
+	private async mergeVisibleIntoHidden(V: string): Promise<number> {
 		const adapter = this.app.vault.adapter;
-		const V = this.name, H = this.hiddenName;
+		const H = this.hiddenName;
 		this.strayFailed = [];
 		if (!(await adapter.exists(V)) || !(await adapter.exists(H))) return 0;
 		// A stray is usually open in a tab, and adapter.rename bypasses the vault: an open view
@@ -713,7 +735,8 @@ export class PrivateFolder {
 			const move = async (to: string): Promise<void> => {
 				await this.mkdirs(parentOf(to));
 				if (await this.lexists(this.abs(to))) throw new Error(`${to} appeared meanwhile`);
-				await this.fsRetry(() => adapter.rename(rel, to));
+				await this.fsRetry(() => this.renameIntoHidden(rel, to));
+				await this.forget(rel);
 				(await names(parentOf(to))).add(fold(path.basename(to)));
 				moved++;
 				await fault("merge:after-move");
@@ -729,7 +752,9 @@ export class PrivateFolder {
 					}
 					await move(target);
 				} catch (e) {
-					if ((e as NodeJS.ErrnoException).code !== "ENAMETOOLONG") throw e;
+					// The long name is too much for this disk (Windows says ENOENT for that, the stray still there).
+					const code = (e as NodeJS.ErrnoException).code;
+					if (code !== "ENAMETOOLONG" && !(code === "ENOENT" && (await this.lexists(this.abs(rel))))) throw e;
 					let target = "";
 					for (let n = 1; ; n++) {
 						target = `${dir}/created while locked ${n}${ext}`;
@@ -746,7 +771,10 @@ export class PrivateFolder {
 		for (const dir of [...folders].reverse().concat(V)) {
 			try {
 				const l = await adapter.list(dir);
-				if (l.files.length === 0 && l.folders.length === 0) await fsp.rmdir(this.abs(dir));
+				if (l.files.length === 0 && l.folders.length === 0) {
+					await fsp.rmdir(this.abs(dir));
+					await this.forget(dir);
+				}
 			} catch { /* not empty, or gone */ }
 		}
 		if (moved) {
@@ -766,31 +794,72 @@ export class PrivateFolder {
 		}
 	}
 
+	/** Folders under the hidden folder only: made with Node's fs, so Obsidian never hears of a
+	 *  path under the hidden name (as with the renames into it). */
 	private async mkdirs(dir: string): Promise<void> {
 		if (!dir) return;
-		const adapter = this.app.vault.adapter;
-		let cur = "";
-		for (const part of dir.split("/")) {
-			cur = cur ? cur + "/" + part : part;
-			if (!(await adapter.exists(cur))) await adapter.mkdir(cur);
-		}
+		await fsp.mkdir(this.abs(dir), { recursive: true });
 	}
 
 	// ---- helpers -------------------------------------------------------------------------------
 
-	/** The folder rename, retried on any error (a file held open, an antivirus scan). */
+	/** The visible folder's name as the disk spells it: the setting's, unless the vault root holds
+	 *  a folder of that name in another case (made by hand on a disk that ignores case). Obsidian,
+	 *  the rename and the tabs all go by the disk's spelling. */
+	private async diskName(): Promise<string> {
+		const V = this.name;
+		try {
+			const fold = (n: string) => n.normalize("NFC").toLowerCase();
+			let other: string | null = null;
+			for (const e of await fsp.readdir(this.abs(""), { withFileTypes: true })) {
+				if (!e.isDirectory()) continue;
+				if (e.name === V) return V; // the exact name wins (a disk that tells cases apart may hold both)
+				if (!other && fold(e.name) === fold(V)) other = e.name;
+			}
+			return other ?? V;
+		} catch {
+			return V; // the setting's spelling
+		}
+	}
+
+	/** The folder rename, retried on any error (a file held open, an antivirus scan). Into the
+	 *  hidden folder with Node's fs, then Obsidian forgets the old path; back with the adapter. */
 	private async renameRetry(from: string, to: string, ms: number): Promise<void> {
 		const adapter = this.app.vault.adapter;
+		const into = this.isHiddenPath(to);
 		const deadline = Date.now() + ms;
 		for (;;) {
 			try {
-				await adapter.rename(from, to);
-				return;
+				if (into) await this.renameIntoHidden(from, to);
+				else await adapter.rename(from, to);
+				break;
 			} catch (e) {
 				if (Date.now() >= deadline) throw new Error(`rename ${from} → ${to} failed: ${msg(e)}`);
 				await sleep(RENAME_RETRY_STEP_MS);
-				if (!(await adapter.exists(from)) && (await adapter.exists(to))) return; // done after all
+				if (!(await adapter.exists(from)) && (await adapter.exists(to))) break; // done after all
 			}
+		}
+		if (into) await this.forget(from);
+	}
+
+	/** A rename into the hidden folder, never over an existing file or folder. Obsidian is not told
+	 *  (forget() does that): it must never index a path under the hidden name. */
+	private async renameIntoHidden(from: string, to: string): Promise<void> {
+		const a = this.abs(from), b = this.abs(to);
+		if (await this.lexists(b)) throw new Error(`${to} already exists`);
+		await fsp.rename(a, b);
+	}
+
+	/** Tell Obsidian now that rel is gone, instead of when its file watcher reports it (late by
+	 *  0.1 s to seconds). adapter.update is undocumented (Obsidian 1.14.4, 1.15.1); without it the
+	 *  watcher does the same. Never throws: the rename is done either way. */
+	private async forget(rel: string): Promise<void> {
+		const adapter = this.app.vault.adapter as unknown as { update?: (p: string) => Promise<void> };
+		if (typeof adapter.update !== "function") return;
+		try {
+			await adapter.update(rel);
+		} catch (e) {
+			console.warn("[VLB] could not tell Obsidian that " + rel + " is gone", e);
 		}
 	}
 
@@ -883,16 +952,34 @@ export class PrivateFolder {
 		return this.keyCache.key;
 	}
 
+	/** Tabs of private notes that the layout brought back at a locked start (saved before a quick
+	 *  lock at the quit), under either name. */
+	async closePrivateLeaves(): Promise<void> {
+		if (!this.enabled) return;
+		await this.closeLeavesUnder(this.name);
+		if (this.lastVisibleName && this.lastVisibleName !== this.name) await this.closeLeavesUnder(this.lastVisibleName);
+		await this.closeLeavesUnder(this.hiddenName);
+	}
+
 	/**
 	 * Close every tab showing a file under `prefix`, after saving what was typed in it. Closing
 	 * alone saves too, but asynchronously, and the folder is renamed right after: that write
 	 * would land on the old path and fail, taking the last seconds of typing with it.
+	 * The sidebar's linked panes (Backlinks, Outline, Outgoing links, Local graph, Properties)
+	 * carry the active note as their file too: they stay, and follow the next note by themselves.
+	 * A tab not opened since the start (a deferred view) has no file yet, only its saved state.
 	 */
 	private async closeLeavesUnder(prefix: string): Promise<void> {
 		const leaves: WorkspaceLeaf[] = [];
 		this.app.workspace.iterateAllLeaves((leaf) => {
-			const f = (leaf.view as unknown as { file?: TFile }).file;
-			if (f && (f.path === prefix || f.path.startsWith(prefix + "/"))) leaves.push(leaf);
+			const v = leaf.view as unknown as { file?: TFile | null; navigation?: boolean };
+			if (v.file) {
+				if (v.navigation === true && under(v.file.path, prefix)) leaves.push(leaf);
+				return;
+			}
+			if (this.inSidebar(leaf)) return; // a deferred pane's state names the active note
+			const f = stateFile(leaf);
+			if (f && under(f, prefix)) leaves.push(leaf);
 		});
 		type Saver = { save?: () => Promise<void>; saving?: boolean };
 		const views = leaves.map((l) => l.view as unknown as Saver);
@@ -904,6 +991,12 @@ export class PrivateFolder {
 		const deadline = Date.now() + 3000;
 		while (views.some((v) => v.saving) && Date.now() < deadline) await sleep(50);
 		for (const l of leaves) l.detach();
+	}
+
+	private inSidebar(leaf: WorkspaceLeaf): boolean {
+		const root = (leaf as unknown as { getRoot?: () => unknown }).getRoot?.();
+		const ws = this.app.workspace as unknown as { leftSplit?: unknown; rightSplit?: unknown };
+		return !!root && (root === ws.leftSplit || root === ws.rightSplit);
 	}
 
 	/**
@@ -934,6 +1027,17 @@ function under(p: string, name: string): boolean {
 function parentOf(p: string): string {
 	const i = p.lastIndexOf("/");
 	return i < 0 ? "" : p.slice(0, i);
+}
+
+/** The file a leaf's saved view state names (a deferred view has nothing else). */
+function stateFile(leaf: WorkspaceLeaf): string | null {
+	try {
+		const st = (leaf as unknown as { getViewState?: () => { state?: { file?: unknown } } }).getViewState?.();
+		const f = st?.state?.file;
+		return typeof f === "string" ? f : null;
+	} catch {
+		return null;
+	}
 }
 
 function same(a: Uint8Array, b: Uint8Array): boolean {

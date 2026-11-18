@@ -3,6 +3,66 @@
 Each release's section below becomes its GitHub release notes. Versions follow
 [semantic versioning](https://semver.org).
 
+## 2.0.0 — unreleased
+
+Obsidian stays usable while locked: only the private folder is locked. Nothing to set on the
+computer.
+
+- **Locking hides the private folder, not the window.** While locked, the private folder is
+  gone from Obsidian and, when encryption is on, encrypted as in 1.9.0. The rest of the
+  vault, search, the command palette, hotkeys and Settings work as usual. The folder still
+  locks when Obsidian starts, after the idle minutes, when the window loses focus (if that
+  is on) and when Obsidian closes.
+- **A padlock in the left ribbon.** Closed while locked: a click opens a small *Unlock
+  private folder* dialog that asks for the passphrase and shows "Unlocking… n of N" while
+  the folder is decrypted. Open while unlocked: a click locks. The commands are *Lock
+  private folder* (a hotkey set for the old *Lock vault now* still works) and *Unlock
+  private folder*. Closing the dialog during the decrypt does not stop it: the folder
+  appears when it is done and the padlock opens then.
+- **Links no longer lead into the hidden folder.** Obsidian is never told where the folder
+  went, so a link to a private note finds nothing while locked and works again after the
+  unlock. In 1.9.0 a link clicked right after a lock could open the note from the hidden
+  folder, and bookmarks and tab history were moved there.
+- **At each lock**, open private notes close (the sidebar's Backlinks, Outline and similar
+  panes stay), open dialogs close (one may show a private note's text; Settings stays), notes
+  in Reading view that embed a private note are drawn again without it, and File recovery's
+  snapshots of private notes are deleted (Obsidian keeps those copies outside the vault),
+  including the snapshots a note made elsewhere kept under its old name when it was moved
+  into the private folder.
+- **A note made in the private folder while locked** (a new note there, a link clicked, a
+  folder made by hand) is hidden at the next lock: the padlock or command, the idle lock, the
+  focus-loss lock and closing Obsidian all do it. Before, such a note stayed visible until
+  the next start.
+- **A restore from the server while locked** writes none of the private notes, also when the
+  vault has no private folder yet; they arrive after the next unlock. In 1.9.0 they were
+  written under the lock screen and hidden afterwards; now the window is in use.
+- **The whole-window lock screen is only a fallback now.** It covers Obsidian, pop-out
+  windows included, when the folder cannot be hidden (a file held open by another program)
+  and goes away by itself once a retry hides the folder. The plugin's built-in emergency
+  mode keeps the whole-window lock as before.
+- **Hide only works as before.** With encryption off the folder is hidden and nothing is
+  encrypted.
+- Server: computers that pair from now on start with encryption off (`vlb encrypt default
+  on|off` changes that; paired computers keep theirs). Fixes published for 1.9.x do not run
+  on 2.0.0, and `vlb status` says when File recovery's clean-up found nothing to work on.
+- Known limits:
+  - Bookmarks of private notes can show their names while locked. Bookmarks and tab
+    history that 1.9.0 moved to the hidden folder stay broken: add them again.
+  - Other plugins may keep what they read from private notes. Embeds in Live Preview and
+    Canvas may show a private note until it is opened again.
+  - File recovery makes new snapshots of private notes while unlocked; they are deleted
+    at the next lock. If Obsidian changes how it keeps them, nothing is deleted (the notes
+    are not touched) and `vlb status` says so.
+  - A plugin update from the server can now start while you work on other notes (within
+    30 seconds of a lock). A file created in the private folder while locked (a link
+    click) holds the update back until the next lock hides it.
+  - A note made elsewhere and moved into the private folder: if a new note takes its old
+    name before the next lock, that note's File recovery snapshots go with it, once.
+  - Built for Obsidian 1.14.4 and 1.15.1; other versions are untested.
+  - As in 1.9.0: the private folder is readable while unlocked; anyone who can read the
+    plugin's `data.json` has the key; file names inside the hidden folder stay visible to
+    someone who shows hidden files.
+
 ## 1.9.0 — 2026-11-16
 
 The private folder is now encrypted on disk while the vault is locked. Nothing to set on the

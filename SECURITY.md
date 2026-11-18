@@ -39,8 +39,9 @@ privacy screen with known limits, by design:
 
 Things worth reporting, for example:
 
-- a way to get past the lock screen or reach the vault's notes inside Obsidian while locked,
-  without touching files on disk;
+- a way to open the private folder's notes inside Obsidian while locked (a link, a
+  bookmark, search, an embed), without touching files on disk (since 2.0.0 the rest of the
+  vault stays usable while locked, by design);
 - the private folder appearing in Obsidian while locked;
 - a private file left readable on disk after a lock has finished (other than the limits
   above, or a file another program holds open), or a private file lost or damaged by the

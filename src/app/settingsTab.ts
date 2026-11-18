@@ -5,7 +5,7 @@ import { PassphraseModal } from "./passphrase";
 
 /**
  * The body of the plugin's setting tab (the core owns the tab itself). Only the passphrase
- * and the lock. The backup pairs itself with the server and runs by itself; the server
+ * and the lock of the private folder. The backup pairs itself with the server and runs by itself; the server
  * changes its options through _control/config.json.
  */
 export function renderSettings(el: HTMLElement, host: Host, owner: VaultLockApp): void {
@@ -15,14 +15,14 @@ export function renderSettings(el: HTMLElement, host: Host, owner: VaultLockApp)
 	new Setting(el)
 		.setName("Passphrase")
 		.setDesc(s.passHash
-			? "Needed to unlock the vault."
-			: "Not set yet. Until you set one, the vault never locks and the private folder stays visible.")
+			? "Needed to unlock the private folder."
+			: "Not set yet. Until you set one, the private folder stays visible.")
 		.addButton((b) => b.setButtonText(s.passHash ? "Change passphrase" : "Set passphrase").setCta()
 			.onClick(() => new PassphraseModal(owner, redraw).open()));
 
 	new Setting(el)
 		.setName("Lock after idle (minutes)")
-		.setDesc("0 disables the idle lock.")
+		.setDesc("Locks the private folder after this many minutes without activity. 0 turns it off.")
 		.addText((t) => t.setValue(String(s.idleMinutes)).onChange(async (v) => {
 			if (v.trim() === "") return; // an emptied box while retyping is not "0"
 			const n = Number(v);
@@ -31,6 +31,7 @@ export function renderSettings(el: HTMLElement, host: Host, owner: VaultLockApp)
 
 	new Setting(el)
 		.setName("Lock when the window loses focus")
+		.setDesc("Locks the private folder when you switch to another app.")
 		.addToggle((t) => t.setValue(s.lockOnBlur).onChange(async (v) => { s.lockOnBlur = v; await host.saveSettings(); }));
 
 	new Setting(el)

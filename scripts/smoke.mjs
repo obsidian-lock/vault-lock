@@ -6,9 +6,15 @@
 // the private folder (cases 16-24c): the key from the server, the backup gate while locked,
 // the stray merge, a stop at every step of a file's transformation, the read-back verify, the
 // pair rule, the kill switch, the lifeboat, the quit task, the deferred restore (also with a
-// lock landing mid-restore, a file gone from the server, a folder rename that keeps failing)
-// and one pass at a time. Plain Node, no dependencies, about 90 s (one case waits out the 30 s
-// rename retry, two wait for the 10 s hide retry). Run
+// lock landing mid-restore, a file gone from the server, a locked vault with no folder yet)
+// and one pass at a time. Since 2.0.0 (cases 25-36) the lock hides only the private folder:
+// locked() means "nothing private is exposed", the whole-window lock screen is only the
+// fallback when the folder cannot be renamed (the lifeboat keeps it), the padlock and the
+// unlock dialog, a 1.9.x app.js (API 1) refused, Obsidian never told a .Private path,
+// hide-only (encryption off), Private/ made while locked, File recovery's rows of moved notes,
+// the folder spelled in another case, which tabs a lock closes, the dialog at a switch and a
+// cover left over a hidden folder. Plain Node, no dependencies, about 3 minutes (one case waits out
+// the 30 s rename retry, several wait for the 10 s hide retry). Run
 // after `npm run build` and `node scripts/build-tests.mjs` (npm test does both); exits
 // non-zero on the first failure.
 //
@@ -26,6 +32,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { backupsDb, fakeIDB, KeyRange } from "./fake-idb.mjs";
 
 const require = createRequire(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -127,36 +134,82 @@ const fsShim = hookedFs(fs, false, fsPromisesShim);
 /** saveData (data.json) / adapter.write of data.bak.json fail this many times while the settings hold a vault key;
  *  delay: the next saveData of a key takes this long first (a slow disk while the key arrives). */
 const saveFail = { data: 0, bak: 0, delay: 0 };
+const eperm = () => Object.assign(new Error("EPERM: operation not permitted, rename (test: held by another program)"), { code: "EPERM" });
+/** The private folder's rename in direction dir ("hide" or "show") fails for ms from now, by
+ *  either road: Obsidian's adapter or Node's fs (since 2.0.0 the hide goes through fs). */
+function failFolderRename(dir, ms) {
+	const until = performance.now() + ms;
+	hooks.adapter = (name, a) => { if (name === "rename" && folderRename(a[0], a[1]) === dir && performance.now() < until) throw eperm(); return 0; };
+	hooks.fs = (name, a) => { if (/^rename/.test(name) && typeof a[0] === "string" && typeof a[1] === "string" && folderRename(a[0], a[1]) === dir && performance.now() < until) throw eperm(); return 0; };
+}
+
+// ---- what Obsidian is told about the hidden folder ------------------------------------------
+
+/** Obsidian's adapter.rename moves its own index entries to the new path and fires "renamed" for
+ *  the folder and every file under it, with no check for hidden paths (Obsidian 1.14.4/1.15.1):
+ *  a .Private path then sits in the vault's file map, the metadata cache, bookmarks, tab history
+ *  and the recent files, and a link to Private/x opens .Private/x. So no rename into .Private,
+ *  and no create under it, may go through the adapter (2.0.0): every such call is noted here. */
+let adapterHidden = [];
+const isHiddenRel = (p) => typeof p === "string" && (p === ".Private" || p.startsWith(".Private/"));
+function noHiddenPaths(when) {
+	const seen = adapterHidden;
+	adapterHidden = [];
+	check(seen.length === 0, `Obsidian's adapter was given a .Private path${when ? " " + when : ""} (it would index and announce it): ` + seen.slice(0, 5).join("; "));
+}
 
 // ---- DOM: just enough for the lock screens and the cover -------------------------------
 
 /** Every element the plugin created (createElement / createDiv / createEl), as plain records. */
 let created = [];
-/** Set when the cover was removed while no lock screen was up: the vault showed unlocked. */
+/** Set when the cover was removed while the private folder was visible on disk and no lock
+ *  screen was up: the private notes showed. (Since 2.0.0 a cover over a hidden folder may go.) */
 let coverBlind = false;
 /** Note titles the plugin put into the window title while something was locked or covered. */
 let titleLeaks = [];
 /** True while the test itself plays Obsidian setting a note title. */
 let obsidianWrites = false;
+/** The vault the current case runs on (for "is Private/ visible on disk"). */
+let activeBase = "";
 
 const lockUp = () => byCls("vlb-overlay").some((e) => e.isConnected) || byId("vlb-lifeboat").some((e) => e.isConnected);
 const hiding = () => lockUp() || byId("vlb-cover").some((e) => e.isConnected);
+const privateOnDisk = () => !!activeBase && fs.existsSync(path.join(activeBase, "Private"));
 
-function el(tag, opts, track = false) {
+function el(tag, opts, track = false, parent = null) {
 	const o = typeof opts === "string" ? { cls: opts } : opts ?? {};
-	const rec = { tag, id: "", cls: o.cls ?? "", text: o.text ?? "", title: "", value: "", disabled: false, style: {}, isConnected: false, removed: false };
+	const rec = {
+		tag, id: "", cls: o.cls ?? "", text: o.text ?? "", title: "", value: "", type: o.type ?? "", disabled: false, style: {},
+		isConnected: false, removed: false, attrs: { ...(o.attr ?? {}) }, listeners: {}, parent, classes: new Set(),
+	};
 	if (track) created.push(rec);
-	const make = (t, x) => el(t, x, true);
+	const make = (t, x) => el(t, x, true, rec);
 	const proxy = new Proxy(rec, {
 		get(r, k) {
 			if (typeof k === "symbol" || k === "then") return undefined;
+			if (k === "__rec") return r;
 			if (k in r) return r[k];
 			if (k === "contains") return () => false;
+			// Just enough of querySelector for the lock's dialog clean-up: ".a" and ".a, .b" (class names), among the tracked descendants.
+			if (k === "querySelectorAll") return (sel) => created.filter((x) => x !== r && inside(x, r) && matchesSelector(x, sel)).map((x) => x.__proxy);
+			if (k === "querySelector") return (sel) => created.find((x) => x !== r && inside(x, r) && matchesSelector(x, sel))?.__proxy ?? null;
+			if (k === "click") return () => fire(r, "click");
+			if (k === "classList") return { add: (...c) => { for (const x of c) r.classes.add(x); }, remove: (...c) => { for (const x of c) r.classes.delete(x); }, contains: (c) => r.classes.has(c) };
 			if (k === "remove") return () => {
-				if (r.id === "vlb-cover" && r.isConnected && !lockUp()) coverBlind = true;
+				if (r.id === "vlb-cover" && r.isConnected && !lockUp() && privateOnDisk()) coverBlind = true;
 				r.isConnected = false;
 				r.removed = true;
 			};
+			// Attributes (the padlock's aria-label) and listeners (the unlock dialog's Enter and click).
+			if (k === "setAttribute") return (a, v) => { r.attrs[a] = String(v); };
+			if (k === "getAttribute") return (a) => (a in r.attrs ? r.attrs[a] : null);
+			if (k === "removeAttribute") return (a) => { delete r.attrs[a]; };
+			if (k === "addEventListener") return (t, fn) => { (r.listeners[t] ??= []).push(fn); };
+			if (k === "removeEventListener") return (t, fn) => { r.listeners[t] = (r.listeners[t] ?? []).filter((f) => f !== fn); };
+			if (k === "onClickEvent") return (fn) => { (r.listeners.click ??= []).push(fn); };
+			if (k === "addClass") return (...c) => { for (const x of c) r.classes.add(x); };
+			if (k === "removeClass") return (...c) => { for (const x of c) r.classes.delete(x); };
+			if (k === "hasClass") return (c) => r.classes.has(c) || r.cls === c;
 			if (k === "appendChild") return (c) => { c.isConnected = true; return c; };
 			if (k === "createElement") return (t) => make(t);
 			if (k === "createDiv") return (x) => { const c = make("div", x); c.isConnected = true; return c; };
@@ -171,11 +224,18 @@ function el(tag, opts, track = false) {
 				// A title change is a change in <head>: the title guards hear about it.
 				for (const ob of observers) queueMicrotask(() => ob.cb([], ob));
 			}
+			if (k === "className") r.cls = String(v);
 			r[k] = v;
 			return true;
 		},
 	});
+	Object.defineProperty(rec, "__proxy", { value: proxy, enumerable: false });
 	return proxy;
+}
+/** rec has one of the classes of sel (".a", ".a, .b"). */
+function matchesSelector(rec, sel) {
+	const own = new Set([...rec.classes, ...String(rec.cls).split(/\s+/).filter(Boolean)]);
+	return sel.split(",").some((s) => { const m = /^\s*\.([\w-]+)\s*$/.exec(s); return m && own.has(m[1]); });
 }
 
 globalThis.window = globalThis;
@@ -186,14 +246,30 @@ globalThis.MutationObserver = class {
 	disconnect() { observers.delete(this); }
 };
 
+/** Calls what the plugin registered for an event on an element (a key or a click). */
+function fire(rec, type, more = {}) {
+	const fns = rec.listeners[type] ?? [];
+	const ev = { type, key: "", target: rec, isComposing: false, preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {}, ...more };
+	for (const fn of fns) fn(ev);
+	return fns.length;
+}
+/** Is rec inside root (an element record)? */
+function inside(rec, root) {
+	for (let r = rec; r; r = r.parent) if (r === root) return true;
+	return false;
+}
+
 function freshDocument() {
+	noHiddenPaths("(in the step before)");
 	created = [];
 	coverBlind = false;
 	titleLeaks = [];
+	openModals.length = 0;
 	observers.clear();
 	const doc = el("document");
 	doc.head = el("head");
 	doc.body = el("body");
+	doc.head.__rec.parent = doc.body.__rec.parent = doc.__rec; // querySelector walks parents
 	doc.title = "Note - My vault - Obsidian";
 	globalThis.document = doc;
 	delete globalThis.__vaultLock;
@@ -247,7 +323,15 @@ class Component {
 class Plugin extends Component {
 	constructor(app, manifest) { super(); this.app = app; this.manifest = manifest; this.commands = []; this.tabs = []; }
 	addCommand(c) { this.commands.push(c); return c; }
-	addRibbonIcon(icon, title, callback) { (this.ribbon ??= []).push({ icon, title, callback }); return el("div"); }
+	/** Recorded in __ribbons (the core keeps the element it gets back in its own field). Obsidian
+	 *  sets the icon and the aria-label from the title. */
+	addRibbonIcon(icon, title, callback) {
+		const e = el("div", { cls: "side-dock-ribbon-action" }, true);
+		e.icon = icon;
+		e.setAttribute("aria-label", title);
+		(this.__ribbons ??= []).push({ icon, title, callback, el: e });
+		return e;
+	}
 	addSettingTab(t) { this.tabs.push(t); }
 	async loadData() {
 		try { return JSON.parse(fs.readFileSync(path.join(this.app.vault.adapter.getBasePath(), PLUGIN_DIR, "data.json"), "utf8")); } catch { return null; }
@@ -278,9 +362,15 @@ class FileSystemAdapter {
 	getFullPath(p) { return path.join(this.base, p); }
 	async hook(name, ...a) {
 		hooks.log?.push(["adapter." + name, ...a.filter((x) => typeof x === "string")]);
+		if (name === "rename" && isHiddenRel(a[1])) adapterHidden.push(`adapter.rename(${a[0]}, ${a[1]})`);
+		if (/^(mkdir|write|writeBinary|append|copy)$/.test(name) && isHiddenRel(a[name === "copy" ? 1 : 0])) adapterHidden.push(`adapter.${name}(${a[name === "copy" ? 1 : 0]})`);
 		const r = hooks.adapter?.(name, a);
 		if (isDelay(r)) await sleep(r);
 	}
+	/** Obsidian reconciles its index with the disk for this path at once (undocumented; 1.14.4,
+	 *  1.15.1): a path that is gone is dropped. A case can take it away (an own property set to
+	 *  undefined) to play an Obsidian without it. */
+	async update(p) { await this.hook("update", p); }
 	async exists(p) { await this.hook("exists", p); return fs.existsSync(this.getFullPath(p)); }
 	async stat(p) {
 		await this.hook("stat", p);
@@ -328,18 +418,58 @@ class FileSystemAdapter {
 	}
 }
 
+/** Every Modal open now, in the order opened (the unlock dialog, the passphrase dialog). */
+const openModals = [];
+class Scope {
+	constructor() { this.keys = []; }
+	register(modifiers, key, func) { const h = { modifiers, key, func }; this.keys.push(h); return h; }
+	unregister(h) { this.keys = this.keys.filter((x) => x !== h); }
+}
+/** Obsidian's Modal: open() runs onOpen, close() (Esc, a click outside, the X button) runs onClose once. */
+class Modal {
+	constructor(app) {
+		this.app = app;
+		this.scope = new Scope();
+		this.containerEl = el("div", { cls: "modal-container" }, true);
+		this.modalEl = el("div", { cls: "modal" }, true, this.containerEl.__rec);
+		this.closeButtonEl = el("div", { cls: "modal-close-button" }, true, this.modalEl.__rec);
+		this.closeButtonEl.addEventListener("click", () => this.close());
+		this.titleEl = el("div", { cls: "modal-title" }, true, this.modalEl.__rec);
+		this.contentEl = el("div", { cls: "modal-content" }, true, this.modalEl.__rec);
+		this.__open = false;
+	}
+	open() {
+		if (this.__open) return;
+		this.__open = true;
+		this.containerEl.__rec.isConnected = true;
+		this.containerEl.__rec.parent = globalThis.document.body.__rec; // Obsidian appends it to the body
+		openModals.push(this);
+		this.onOpen?.();
+	}
+	close() {
+		if (!this.__open) return;
+		this.__open = false;
+		this.containerEl.__rec.isConnected = false;
+		const i = openModals.indexOf(this);
+		if (i >= 0) openModals.splice(i, 1);
+		this.onClose?.();
+	}
+	setTitle(t) { this.titleEl.setText(t); return this; }
+	setContent(c) { if (typeof c === "string") this.contentEl.setText(c); return this; }
+	onOpen() {}
+	onClose() {}
+}
+
 const obsidian = {
 	Component,
 	Plugin,
 	PluginSettingTab: class { constructor(app, plugin) { this.app = app; this.plugin = plugin; this.containerEl = el("div"); } },
-	Modal: class {
-		constructor(app) { this.app = app; this.titleEl = el("div"); this.contentEl = el("div"); }
-		open() { this.onOpen?.(); }
-		close() { this.onClose?.(); }
-	},
+	Modal,
 	Notice: class { constructor() {} },
 	Setting: class { constructor() { return chain(); } },
-	Scope: class {},
+	Scope,
+	/** Obsidian's icon helper: the element shows that icon now. */
+	setIcon: (e, id) => { e.icon = id; },
 	// The real platform: on the Windows runners attrib.exe and the hidden-file rules are exercised for real.
 	Platform: { isWin: process.platform === "win32", isDesktop: true },
 	FileSystemAdapter,
@@ -417,22 +547,57 @@ function makeVault(data, coreJson) {
 	fs.writeFileSync(path.join(base, "Note.md"), "note");
 	if (data) fs.writeFileSync(path.join(base, PLUGIN_DIR, "data.json"), JSON.stringify(data));
 	if (coreJson) fs.writeFileSync(path.join(base, PLUGIN_DIR, "core.json"), JSON.stringify(coreJson));
+	activeBase = base;
 	return { base, app: makeApp(base) };
 }
-/** Obsidian's app over a vault folder. workspace.on keeps the callbacks in handlers (the quit task). */
+/** Obsidian's app over a vault folder. workspace.on keeps the callbacks in handlers (the quit
+ *  task, window-open); workspace.leaves is what iterateAllLeaves walks (a case adds tabs: see leaf()). */
 function makeApp(base) {
 	const handlers = {};
+	const leaves = [];
 	return {
 		handlers,
+		appId: "smoke",
 		vault: { adapter: new FileSystemAdapter(base), configDir: ".obsidian", on: () => ({}) },
 		workspace: {
 			onLayoutReady: () => {}, // layout never ready: no backup, no dialog, no ticks
 			on: (name, cb) => { (handlers[name] ??= []).push(cb); return {}; },
-			iterateAllLeaves: () => {},
+			leaves,
+			iterateAllLeaves: (cb) => { for (const l of leaves.slice()) cb(l); },
+			rootSplit: { side: "root" },
+			leftSplit: { side: "left" },
+			rightSplit: { side: "right" },
 		},
 		keymap: keymap(),
 		setting: { close() {} },
 	};
+}
+/** A tab in the stub workspace. file: the open note's path (a loaded view; navigation true as for
+ *  Obsidian's note views, false for a linked sidebar pane); state: the saved view state of a tab
+ *  not opened since the start (a deferred view: no file); sidebar: in the right sidebar; doc/win:
+ *  a pop-out window's. detach() takes it out of the workspace and sets detached. */
+function leaf(app, { file, navigation = true, state, sidebar = false, doc = null, win = null } = {}) {
+	const l = {
+		detached: false,
+		view: { containerEl: { win: win ?? globalThis, doc: doc ?? globalThis.document }, navigation },
+		getViewState: () => ({ type: "markdown", state: state ?? (file ? { file } : {}) }),
+		getRoot: () => (sidebar ? app.workspace.rightSplit : app.workspace.rootSplit),
+		detach() { this.detached = true; const i = app.workspace.leaves.indexOf(l); if (i >= 0) app.workspace.leaves.splice(i, 1); },
+	};
+	if (file) l.view.file = Object.assign(new obsidian.TFile(), { path: file });
+	app.workspace.leaves.push(l);
+	return l;
+}
+/** A pop-out window: its own document (a title, a body) and timers. */
+function popoutWindow() {
+	const doc = el("document");
+	doc.head = el("head");
+	doc.body = el("body");
+	doc.head.__rec.parent = doc.body.__rec.parent = doc.__rec;
+	obsidianWrites = true; // Obsidian names the new window after its note
+	doc.title = "Note - My vault - Obsidian";
+	obsidianWrites = false;
+	return { document: doc, setTimeout: globalThis.setTimeout.bind(globalThis), clearTimeout: globalThis.clearTimeout.bind(globalThis) };
 }
 /** Obsidian's keymap as far as scopes go: the top one gets the keys first; an empty one stops
  *  Obsidian's hotkeys (Ctrl+N, Ctrl+W, ...); pop takes a scope out wherever it is. */
@@ -445,16 +610,8 @@ function keymap() {
 }
 const coreState = (base) => JSON.parse(fs.readFileSync(path.join(base, PLUGIN_DIR, "core.json"), "utf8"));
 
-/** Dotted versions compared segment by segment (src/shared/version.ts). */
-function cmpV(a, b) {
-	const pa = a.split("-")[0].split(".").map((x) => parseInt(x, 10) || 0), pb = b.split("-")[0].split(".").map((x) => parseInt(x, 10) || 0);
-	for (let i = 0; i < Math.max(pa.length, pb.length); i++) if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) > (pb[i] ?? 0) ? 1 : -1;
-	return 0;
-}
-// Obsidian hands the plugin manifest.json's version. The core refuses plugin code older than
-// 1.9.0 and 11d needs a server bundle that ties with the built-in, so until manifest.json is
-// bumped to 1.9.0 (the release step) the stub hands the plugin 1.9.0.
-const manifest = { id: "vault-lock", name: "Vault Lock", version: cmpV(manifestJson.version, "1.9.0") < 0 ? "1.9.0" : manifestJson.version, dir: PLUGIN_DIR };
+// Obsidian hands the plugin manifest.json's version.
+const manifest = { id: "vault-lock", name: "Vault Lock", version: manifestJson.version, dir: PLUGIN_DIR };
 const BUILTIN = "builtin:" + manifest.version;
 const byId = (id) => created.filter((e) => e.id === id);
 const byCls = (cls) => created.filter((e) => e.cls === cls);
@@ -468,11 +625,11 @@ function gate() {
 }
 
 /** A fresh document and vault, the plugin loaded from file (main.js or a test build).
- *  opts.keys: signing keys for server bundles; opts.before(base): runs before onload. */
+ *  opts.keys: signing keys for server bundles; opts.before(base, app): runs before onload. */
 async function startPlugin(Cls, data, coreJson, opts = {}) {
 	freshDocument();
 	const { base, app } = makeVault(data, coreJson);
-	if (opts.before) opts.before(base);
+	if (opts.before) opts.before(base, app);
 	const p = new Cls(app, manifest);
 	if (opts.keys) p.supervisor.keys = opts.keys;
 	await within(p.load(), 10_000, "onload");
@@ -480,12 +637,14 @@ async function startPlugin(Cls, data, coreJson, opts = {}) {
 	return { p, S: p.supervisor, base, app };
 }
 
-/** Unload, wait for the stop, and clear a cover left behind (it would remove itself after 5 s). */
+/** Unload, wait for the stop, and clear a cover left behind (it would remove itself after 5 s).
+ *  Every case that ends here also proves Obsidian was never told a .Private path. */
 async function stopPlugin(p) {
 	p.unload();
 	const left = globalThis.__vaultLock?.cover;
 	if (left) clearTimeout(left.timer);
 	await within(globalThis.__vaultLock?.stopping ?? Promise.resolve(), 5_000, "stopping");
+	noHiddenPaths();
 	return left;
 }
 
@@ -653,17 +812,57 @@ const readData = (base, f = "data.json") => JSON.parse(fs.readFileSync(path.join
 /** The text the lock screen shows in its error line (progress while unlocking, or why it failed). */
 const errText = () => byCls("vlb-error").at(-1)?.text ?? "";
 const overlayUp = () => byCls("vlb-overlay").some((e) => e.isConnected);
-/** Every text the private folder sent to its progress callback ("Unlocking… n of N"). */
+/** Every text the private folder sent to its progress callback ("Unlocking… n of N"). Recorded
+ *  also when nobody set one (since 2.0.0 only the unlock dialog does; a direct tryUnlock does not). */
 function recordProgress(pf) {
 	const seen = [];
 	let inner = pf.progress ?? null;
 	Object.defineProperty(pf, "progress", {
 		configurable: true,
 		enumerable: true,
-		get: () => (inner ? (t) => { seen.push(t); return inner(t); } : null),
+		get: () => (t) => { seen.push(t); return inner?.(t); },
 		set: (fn) => { inner = fn; },
 	});
 	return seen;
+}
+
+// ---- 2.0.0: the folder, not the window ----------------------------------------------------
+
+/** Locked the 2.0.0 way: .Private/ on disk, no Private/. */
+const hiddenOn = (base) => fs.existsSync(path.join(base, H_DIR)) && !fs.existsSync(path.join(base, V_DIR));
+/** Unlocked: Private/ on disk, no .Private/. */
+const visibleOn = (base) => fs.existsSync(path.join(base, V_DIR)) && !fs.existsSync(path.join(base, H_DIR));
+/** The padlock as the user sees it: [icon, aria-label] of the ribbon element the core keeps. */
+const padlock = (p) => [p.ribbon?.icon ?? null, p.ribbon?.getAttribute?.("aria-label") ?? null];
+const PAD_LOCKED = JSON.stringify(["lock", "Unlock private folder"]);
+const PAD_OPEN = JSON.stringify(["lock-open", "Lock private folder"]);
+function padlockIs(p, locked, what) {
+	const got = JSON.stringify(padlock(p));
+	check(p.uiLocked === locked && got === (locked ? PAD_LOCKED : PAD_OPEN), `${what}: the padlock shows ${got} (uiLocked ${p.uiLocked}), want ${locked ? PAD_LOCKED : PAD_OPEN}`);
+}
+/** A click on the padlock in the ribbon (the core's own callback). */
+function clickPadlock(p) {
+	const r = p.__ribbons ?? [];
+	check(r.length === 1 && typeof r[0].callback === "function", "no single ribbon item: " + r.map((x) => x.title));
+	r[0].callback();
+}
+/** The unlock dialog that is open now: the modal, its password input and its error line. */
+function unlockDialog() {
+	check(openModals.length === 1, `${openModals.length} dialog(s) open, want the unlock dialog`);
+	const modal = openModals[0];
+	const root = modal.modalEl.__rec;
+	check(/Unlock private folder/.test(modal.titleEl.__rec.text), "the open dialog is not titled 'Unlock private folder': " + JSON.stringify(modal.titleEl.__rec.text));
+	const inputs = created.filter((e) => e.tag === "input" && inside(e, root) && (e.type === "password" || e.attrs.type === "password"));
+	check(inputs.length === 1, `the unlock dialog has ${inputs.length} password input(s), want 1`);
+	const line = () => created.filter((e) => e.cls === "vlb-error" && inside(e, root)).at(-1)?.text ?? "";
+	return { modal, input: inputs[0], line };
+}
+/** Types pass into the dialog and presses Enter there (or clicks its Unlock button). */
+function submitUnlock(d, pass) {
+	d.input.value = pass;
+	if (fire(d.input, "keydown", { key: "Enter" })) return;
+	const btn = created.find((e) => e.tag === "button" && /^Unlock$/.test(e.text) && inside(e, d.modal.modalEl.__rec));
+	check(btn && fire(btn, "click"), "the unlock dialog reacts neither to Enter in its input nor to a click on its Unlock button");
 }
 /** The highest n of an "Unlocking… n of N" seen so far, or -1. */
 function unlockingN(seen) {
@@ -707,6 +906,7 @@ async function unlockApp(cur, what = "unlock") {
 /** A new process on the same vault: a fresh document and window (no chain, no cover), a new app object. */
 async function restartOn(base, Cls, opts = {}) {
 	freshDocument();
+	activeBase = base;
 	const app = makeApp(base);
 	const p = new Cls(app, manifest);
 	if (opts.keys) p.supervisor.keys = opts.keys;
@@ -748,8 +948,16 @@ async function main() {
 		check(byCls("vlb-overlay").length === 0, "a lock screen was shown without a passphrase");
 		check(document.title === "Note - My vault - Obsidian", "window title changed without a passphrase");
 		check(created.some((e) => e.tag === "style" && !e.removed), "the styles were not injected");
-		check(p.commands.map((c) => c.id).join() === "lock,change-passphrase", "commands: " + p.commands.map((c) => c.id));
-		check(p.ribbon?.length === 1 && p.ribbon[0].icon === "lock", "no lock button in the ribbon");
+		const cmds = Object.fromEntries(p.commands.map((c) => [c.id, c.name]));
+		check(Object.keys(cmds).sort().join() === "change-passphrase,lock,unlock", "commands: " + Object.keys(cmds));
+		check(cmds.lock === "Lock private folder" && cmds.unlock === "Unlock private folder", "command names: " + JSON.stringify(cmds));
+		// The padlock (F.2): its title is fixed (Obsidian keys the item by it); without a passphrase it shows open.
+		check(p.__ribbons?.length === 1 && p.__ribbons[0].title === "Vault Lock" && p.ribbon === p.__ribbons[0].el, "no single padlock titled 'Vault Lock' in the ribbon: " + JSON.stringify((p.__ribbons ?? []).map((r) => r.title)));
+		padlockIs(p, false, "without a passphrase");
+		// A click without a passphrase asks for one.
+		clickPadlock(p);
+		check(openModals.length === 1 && /passphrase/i.test(openModals[0].titleEl.__rec.text), "the padlock without a passphrase did not open the passphrase dialog: " + openModals.map((m) => m.titleEl.__rec.text));
+		openModals[0].close();
 		check(p.tabs.length === 1, "no setting tab");
 		p.tabs[0].display();
 		// core.json: the start is recorded until it proves good (90 s) or ends cleanly.
@@ -759,7 +967,7 @@ async function main() {
 		check(p.supervisor.running?.id === BUILTIN && p.supervisor.pending === null, "the tick changed the running app");
 		check(coreState(base).lastUpdateCheck, "the tick did not write core.json");
 		const status = p.supervisor.coreStatus();
-		check(status.running === "builtin" && status.runningId === BUILTIN && status.server === null && status.coreVersion === 2, "coreStatus: " + JSON.stringify(status));
+		check(status.running === "builtin" && status.runningId === BUILTIN && status.server === null && status.coreVersion === 3, "coreStatus: " + JSON.stringify(status));
 		p.unload();
 		check(coreState(base).starting === null, "a clean unload left core.json starting set (the next start would count a crash)");
 		const stopping = globalThis.__vaultLock?.stopping;
@@ -800,7 +1008,9 @@ async function main() {
 		check(byCls("vlb-overlay").every((e) => !e.isConnected), "a lock screen was left after unload");
 	}
 
-	// 3. With a passphrase: locked at start, private folder hidden, cover up then down; unload leaves a cover.
+	// 3. With a passphrase: the private folder is hidden at start under the cover, then the cover
+	// goes and nothing else is up (2.0.0): no lock screen, Obsidian's hotkeys and window title are
+	// its own, the padlock shows closed. Unload while hidden leaves nothing (nothing is exposed).
 	step = "3 start with a passphrase";
 	freshDocument();
 	{
@@ -810,29 +1020,77 @@ async function main() {
 		await macrotask();
 		const cur = p.supervisor.current;
 		check(cur && cur.locked() === true, "not locked at start");
-		check(fs.existsSync(path.join(base, ".Private", "Secret.md")) && !fs.existsSync(path.join(base, "Private")), "the private folder was not hidden");
-		check(byCls("vlb-overlay").some((e) => e.isConnected), "no lock screen");
+		check(cur.lockScreen.locked === true, "lockScreen.locked (the user-facing state) is not true after the start");
+		check(hiddenOn(base) && fs.existsSync(path.join(base, H_DIR, "Secret.md")), "the private folder was not hidden");
+		check(byCls("vlb-overlay").length === 0 && byId("vlb-lifeboat").length === 0, "a whole-window lock screen after a normal lock (2.0.0: only the fallback has one)");
 		const covers = byId("vlb-cover");
 		check(covers.length === 1 && covers[0].removed, "the cover was not made and then removed");
-		check(app.keymap.scopes.length === 1, "keymap scopes after start: " + app.keymap.scopes.length + " (want the lock screen's only)");
-		check(document.title === "Obsidian", "window title not hidden");
-		check(cur.lockScreen && cur.backup && cur.backup.control && cur.privateFolder, "test handles missing");
+		check(app.keymap.scopes.length === 0, "keymap scopes after start: " + app.keymap.scopes.length + " (Obsidian's hotkeys must work while only the folder is locked)");
+		padlockIs(p, true, "after the start");
 		check(cur.host.settings === p.settings, "the app does not share the core's settings object");
-		// Obsidian renames the window after a note while locked: the lock screen keeps "Obsidian".
+		check(cur.lockScreen && cur.backup && cur.backup.control && cur.privateFolder, "test handles missing");
+		// Obsidian stays usable: a note's name goes into the window title.
 		await obsidianSetsTitle("Other - My vault - Obsidian");
-		check(document.title === "Obsidian", "the lock screen let a note title through");
+		check(document.title === "Other - My vault - Obsidian", "the window title is still guarded after a normal lock: " + document.title);
 		noLeaks();
 		p.unload();
-		check(byCls("vlb-overlay").every((e) => !e.isConnected), "the lock screen stayed after unload");
+		check(!globalThis.__vaultLock?.cover, "unload while the folder is hidden left a cover (nothing is exposed)");
+		check(app.keymap.scopes.length === 0, "keymap scopes after unload: " + app.keymap.scopes.length);
+		noLeaks();
+		await within(globalThis.__vaultLock?.stopping ?? Promise.resolve(), 5_000, "stopping");
+
+		// 3b. A reload while hidden: no cover at all; the next copy finds .Private/ and keeps it.
+		step = "3b reload while hidden";
+		const before = byId("vlb-cover").length;
+		const prev = gate();
+		globalThis.__vaultLock = { ...globalThis.__vaultLock, stopping: prev.p };
+		const p2 = new VaultLockPlugin(app, manifest);
+		const loading = p2.load();
+		await macrotask();
+		await macrotask();
+		check(p2.supervisor.current === null && p2.commands.length === 0, "the reload started before the previous copy had stopped");
+		check(byId("vlb-cover").length === before, "a cover went up over a hidden folder");
+		prev.release();
+		await within(loading, 10_000, "onload after reload");
+		check(p2.supervisor.current.locked() === true && hiddenOn(base), "not locked and hidden after the reload");
+		check(byId("vlb-cover").length === before && byCls("vlb-overlay").length === 0, "the reload over a hidden folder put a cover or a lock screen up");
+		padlockIs(p2, true, "after the reload");
+		noLeaks();
+		await stopPlugin(p2);
+	}
+
+	// 3c. The fallback (F.4): the folder rename fails at start (a file held open): the
+	// whole-window lock screen is up instead and locked() is true, so the built-in is kept. Unload
+	// then leaves the cover (it was all that hid a visible folder); a reload takes it over and
+	// hides the folder once the rename works.
+	step = "3c fallback at start; unload leaves the cover";
+	freshDocument();
+	{
+		const { base, app } = makeVault(REAL_PASS);
+		failFolderRename("hide", 60_000);
+		const p = new VaultLockPlugin(app, manifest);
+		await within(p.load(), 15_000, "onload"); // the hide gives up after RENAME_RETRY_MS
+		await macrotask();
+		const cur = p.supervisor.current;
+		check(p.supervisor.running?.id === BUILTIN && !coreState(base).bad[BUILTIN], "a built-in whose rename failed was not kept: " + JSON.stringify({ running: p.supervisor.running, bad: coreState(base).bad }));
+		check(cur.locked() === true && overlayUp() && visibleOn(base), `the fallback is not up: locked() ${cur.locked()}, overlay ${overlayUp()}, ` + listFiles(base).filter((f) => /Private/.test(f)));
+		check(byId("vlb-cover").length === 1 && byId("vlb-cover")[0].removed, "the cover did not hand over to the fallback lock screen");
+		check(app.keymap.scopes.length === 1, "the fallback lock screen does not stop Obsidian's hotkeys (keymap scopes: " + app.keymap.scopes.length + ")");
+		check(document.title === "Obsidian", "window title not hidden by the fallback lock screen");
+		await obsidianSetsTitle("Other - My vault - Obsidian");
+		check(document.title === "Obsidian", "the fallback lock screen let a note title through");
+		padlockIs(p, true, "with the fallback up");
+		noLeaks();
+		p.unload();
+		check(byCls("vlb-overlay").every((e) => !e.isConnected), "the fallback lock screen stayed after unload");
 		const left = globalThis.__vaultLock?.cover;
-		check(left && left.el.isConnected, "unload left no cover over the locked vault");
-		// Obsidian's hotkeys run before the cover's key swallow: the cover holds an empty scope.
+		check(left && left.el.isConnected, "unload left no cover over the visible private folder");
 		check(app.keymap.scopes.length === 1, "the left cover does not stop Obsidian's hotkeys (keymap scopes: " + app.keymap.scopes.length + ")");
 		noLeaks();
 		await within(globalThis.__vaultLock.stopping ?? Promise.resolve(), 5_000, "stopping");
+		resetHooks();
 
-		// 3b. A reload: the next copy takes the cover over and takes it down once it has locked.
-		step = "3b reload takes the cover over";
+		step = "3c reload takes the cover over";
 		const before = byId("vlb-cover").length;
 		// The previous copy is still finishing a backup run: the new one waits, under its cover.
 		const prev = gate();
@@ -850,13 +1108,18 @@ async function main() {
 		await within(loading, 10_000, "onload after reload");
 		check(byId("vlb-cover").length === before, "the reload made a second cover instead of taking the old one");
 		check(!left.el.isConnected && !globalThis.__vaultLock.cover, "the taken-over cover was not removed");
-		check(p2.supervisor.current.locked() === true, "not locked after reload");
-		check(app.keymap.scopes.length === 1, "keymap scopes after the reload: " + app.keymap.scopes.length + " (the taken-over cover's scope was kept?)");
-		await macrotask();
+		const cur2 = p2.supervisor.current;
+		check(cur2.locked() === true && hiddenOn(base) && !overlayUp(), "the reload did not hide the folder once the rename worked");
+		check(app.keymap.scopes.length === 0, "keymap scopes after the reload: " + app.keymap.scopes.length + " (the taken-over cover's scope was kept?)");
 		noLeaks();
 
-		// 3c. A real disable: the left cover goes by itself after 5 s and gives Obsidian its hotkeys back.
-		step = "3c disable: the left cover goes";
+		// 3d. A real disable while the fallback is up: the left cover goes by itself after 5 s and
+		// gives Obsidian its hotkeys back.
+		step = "3d disable: the left cover goes";
+		await unlockApp(cur2);
+		failFolderRename("hide", 60_000);
+		await within(cur2.lock(), 10_000, "lock whose rename fails");
+		check(cur2.locked() && overlayUp() && visibleOn(base), "the fallback is not up after the failed lock");
 		const timers = [];
 		const realSetTimeout = globalThis.setTimeout;
 		globalThis.setTimeout = (fn, ms, ...a) => { const id = realSetTimeout(fn, ms, ...a); timers.push({ fn, id }); return id; };
@@ -866,12 +1129,14 @@ async function main() {
 		check(app.keymap.scopes.length === 1, "the left cover does not stop Obsidian's hotkeys (keymap scopes: " + app.keymap.scopes.length + ")");
 		noLeaks();
 		await within(globalThis.__vaultLock.stopping ?? Promise.resolve(), 5_000, "stopping");
+		resetHooks();
 		const t = timers.find((x) => x.id === left2.timer);
 		check(t, "the left cover has no timer");
 		clearTimeout(t.id);
 		t.fn(); // the 5 s are up (this shows the vault: a disable unlocks, by design)
 		check(!left2.el.isConnected && !globalThis.__vaultLock.cover, "the left cover did not go");
 		check(app.keymap.scopes.length === 0, "the left cover went but left Obsidian's hotkeys off (keymap scopes: " + app.keymap.scopes.length + ")");
+		noHiddenPaths();
 	}
 
 	// 4. Safe mode remembered in core.json: the lifeboat runs, locked, with no network.
@@ -889,16 +1154,24 @@ async function main() {
 		check(document.title === "Obsidian", "the lifeboat let a note title through");
 		noLeaks();
 		const lb = S.current;
+		check(lb.api === 2 && typeof lb.unlock === "function", "the lifeboat is not an API 2 app with unlock()");
+		padlockIs(p, true, "the locked lifeboat");
+		// Its unlock() (the padlock, the command) only focuses its own lock screen: resolves at once (F.9).
+		await within(lb.unlock(), 1_000, "the lifeboat's unlock()");
+		check(lb.locked() && byId("vlb-lifeboat").some((e) => e.isConnected) && openModals.length === 0, "the lifeboat's unlock() did more than focus its lock screen");
 		check(await lb.tryUnlock("wrong") === false && lb.locked(), "the lifeboat opened with a wrong passphrase");
 		check(await lb.tryUnlock("right") === true && !lb.locked(), "the lifeboat did not open with the right passphrase");
 		check(byId("vlb-lifeboat").every((e) => !e.isConnected), "the lifeboat lock screen stayed after unlock");
 		check(fs.existsSync(path.join(base, "Private", "Secret.md")), "the private folder did not come back on unlock");
 		check(document.title === "Other - My vault - Obsidian", "unlock did not give the title back: " + document.title);
+		padlockIs(p, false, "the lifeboat after its unlock");
 		await lb.lock();
 		check(lb.locked() && byId("vlb-lifeboat").some((e) => e.isConnected), "the lock command did not lock the lifeboat");
 		check(fs.existsSync(path.join(base, ".Private", "Secret.md")), "the lock command did not hide the private folder");
+		padlockIs(p, true, "the lifeboat locked again");
+		// The folder is hidden: unloading leaves no cover (nothing is exposed; F.2).
 		const left = await stopPlugin(p);
-		check(left && left.el.isConnected, "unloading the locked lifeboat left no cover");
+		check(!left, "unloading the lifeboat with the folder hidden left a cover");
 		noLeaks();
 	}
 
@@ -940,12 +1213,14 @@ async function main() {
 	freshDocument();
 	{
 		const mod = evaluate("app.js");
-		check(mod.API === 1, "app.js API is " + mod.API);
+		check(mod.API === 2, "app.js API is " + mod.API);
 		check(typeof mod.createApp === "function", "app.js has no createApp");
 		const { app } = makeVault(null);
 		let beats = 0;
+		const states = [];
 		const host = {
-			api: 1,
+			api: 2,
+			lockState: (b) => { states.push(b); },
 			app,
 			manifest,
 			settings: {
@@ -960,10 +1235,12 @@ async function main() {
 			isAborted: () => false,
 		};
 		const a = mod.createApp(host);
-		for (const k of ["start", "stop", "locked", "lock", "changePassphrase", "renderSettings"]) check(typeof a[k] === "function", "app has no " + k);
+		for (const k of ["start", "stop", "locked", "lock", "unlock", "finishLock", "changePassphrase", "renderSettings"]) check(typeof a[k] === "function", "app has no " + k);
+		check(a.api === 2, "the app's api is " + a.api);
 		a.load(); // the core adds it as a child first
 		await within(a.start(), 10_000, "app start");
 		check(a.locked() === false, "app locked without a passphrase");
+		check(states.length >= 1 && states.at(-1) === false, "host.lockState after a start without a passphrase: " + JSON.stringify(states));
 		a.renderSettings(el("div"));
 		check(beats === 0, "heartbeat without a backup run");
 		// A reconcile against a server: heartbeat once it finished and status.json was taken (D.1).
@@ -1021,7 +1298,8 @@ async function main() {
 		check(S.running?.kind === "lifeboat" && S.current.locked(), "safe mode did not switch to the locked lifeboat at once");
 		// The built-in started fine and was replaced within its first 90 s: not a crash at the next start.
 		check(coreState(base).starting === null, "a switch away left core.json starting set: " + JSON.stringify(coreState(base).starting));
-		check(byId("vlb-cover").length === coversBefore + 1 && byId("vlb-cover").every((e) => e.removed), "the switch did not cover the window");
+		// The folder is hidden: the switch needs no cover (F.3); the lifeboat puts its own lock screen up.
+		check(byId("vlb-cover").length === coversBefore, "a cover went up over a hidden folder at the switch");
 		check(p.app.keymap.scopes.length === 1, "keymap scopes after the switch: " + p.app.keymap.scopes.length + " (want the lifeboat's only)");
 		noLeaks();
 		server.files.set("_control/config.json", Buffer.from(JSON.stringify({ core: { safeMode: false } })));
@@ -1056,7 +1334,7 @@ async function main() {
 		await within(S.tick(), 5_000, "tick");
 		check(probes() === 1 && S.lastProbeOkAt !== null, "a stale backup was not probed");
 		const probe = server.json("_control/core-probe.json");
-		check(probe.core === 2 && !Number.isNaN(Date.parse(probe.at)), "probe body: " + JSON.stringify(probe));
+		check(probe.core === 3 && !Number.isNaN(Date.parse(probe.at)), "probe body: " + JSON.stringify(probe));
 		check(S.running?.id === BUILTIN && !S.state.bad[BUILTIN], "blamed the app after one probe");
 		// A second good probe less than 9 minutes later: still not blamed.
 		await within(S.tick(), 5_000, "tick");
@@ -1112,17 +1390,18 @@ async function main() {
 		await stopPlugin(p);
 	}
 
-	// 9c. Activation (C.6): a waiting choice is switched to only once the vault is locked.
+	// 9c. Activation (C.6): a waiting choice is switched to only once nothing private is exposed
+	// (locked() reads the disk since 2.0.0, so the folder is really unlocked and locked here).
 	step = "9c activation at the next lock";
 	{
-		const { p, S } = await startPlugin(VaultLockPlugin, PASS);
+		const { p, S } = await startPlugin(VaultLockPlugin, REAL_PASS);
 		const cur = S.current;
 		S.pending = { choice: "lifeboat", serverState: "none", why: "test" };
-		cur.lockScreen.locked = false; // as if unlocked by the user
+		await unlockApp(cur);
 		S.activationTick();
 		await macrotask();
-		check(S.switching === null && S.current === cur, "switched while the vault was unlocked");
-		cur.lockScreen.locked = true;
+		check(S.switching === null && S.current === cur, "switched while the private folder was visible");
+		await within(cur.lock(), 10_000, "lock");
 		S.activationTick();
 		check(S.switching, "no switch once locked");
 		await within(S.switching, 5_000, "switch");
@@ -1142,9 +1421,12 @@ async function main() {
 	step = "9d unlock during a switch";
 	{
 		const { p, S, base } = await startPlugin(VaultLockPlugin, REAL_PASS);
-		const unlocking = S.current.lockScreen.tryUnlock("right"); // the hash takes a moment
+		const said = [];
+		const unlocking = S.current.lockScreen.tryUnlock("right", (t) => said.push(t)); // the hash takes a moment
 		const switching = S.switchTo("lifeboat", "test");
-		check(await unlocking === false, "a stopping app accepted the passphrase");
+		// The passphrase was right (true), but a stopping app never opens the folder: the box says why.
+		check(await unlocking === true && said.some((t) => /restarting/i.test(t)), "a stopping app did not say it is restarting: " + JSON.stringify(said));
+		check(fs.existsSync(path.join(base, ".Private", "Secret.md")) && !fs.existsSync(path.join(base, "Private")), "a stopping app opened the private folder");
 		await within(switching, 5_000, "switch");
 		check(fs.existsSync(path.join(base, ".Private", "Secret.md")) && !fs.existsSync(path.join(base, "Private")), "the private folder was opened under the new lock screen");
 		check(S.running?.kind === "lifeboat" && S.current.locked(), "the lifeboat is not locked");
@@ -1296,9 +1578,9 @@ async function main() {
 		await within(S.tick(), 5_000, "tick");
 		check(/replay/.test(coreState(base).updateError ?? "") && gets() === 1, "an older manifest was taken: " + coreState(base).updateError);
 		unchanged("replay");
-		publish(server, "app", variant(2), { minCore: 3 });
+		publish(server, "app", variant(2), { minCore: 4 }); // this core is 3 (2.0.0)
 		await within(S.tick(), 5_000, "tick");
-		check(coreState(base).updateError === "app: needs core ≥ 3" && gets() === 1, "minCore 3: " + coreState(base).updateError);
+		check(coreState(base).updateError === "app: needs core ≥ 4" && gets() === 1, "minCore 4: " + coreState(base).updateError);
 		unchanged("minCore");
 		publish(server, "app", variant(2), { kind: "core" });
 		await within(S.tick(), 5_000, "tick");
@@ -1393,44 +1675,72 @@ async function main() {
 		await stopPlugin(p);
 	}
 
-	// 12. With a passphrase: a staged bundle waits for the next lock; one that throws or does
-	// not lock is marked bad and the built-in takes over, locked; nothing shows meanwhile.
+	// 12. With a passphrase: a staged bundle waits until nothing private is exposed; one that
+	// throws is marked bad and the built-in takes over, locked. One that never locks is refused
+	// only where it matters (2.0.0, F.3): started on a hidden folder it exposes nothing and runs;
+	// started while Private/ is visible it is marked bad ("unlocked"). Nothing shows meanwhile.
 	step = "12 server bundle waits for the lock";
 	{
-		const { p, S, base } = await startPlugin(VaultLockPlugin, { ...PASS, ...LOGIN }, null, { keys: [TKEY] });
+		const { p, S, base } = await startPlugin(VaultLockPlugin, { ...REAL_PASS, ...LOGIN }, null, { keys: [TKEY] });
 		server = fakeServer();
 		const P1 = publish(server, "app", appJs);
-		await within(S.tick(), 5_000, "tick");
 		const builtin = S.current;
-		builtin.lockScreen.locked = false; // unlocked by the user
+		await unlockApp(builtin);
 		await within(S.tick(), 5_000, "tick");
 		let cs = S.coreStatus();
 		check(S.running?.id === BUILTIN && S.pending?.choice === "server" && cs.pending === "server" && cs.server?.state === "waiting", "not waiting for the lock: " + JSON.stringify(cs.server));
 		S.activationTick();
-		check(!S.switching, "switched while unlocked");
-		builtin.lockScreen.locked = true;
+		check(!S.switching, "switched while the private folder was visible");
+		await within(builtin.lock(), 10_000, "lock");
 		S.activationTick();
 		await within(S.switching ?? Promise.resolve(), 5_000, "switch");
 		check(S.running?.id === "server:" + P1.sha256.slice(0, 12) && S.current.locked() && S.pending === null, "the server bundle did not take over locked: " + JSON.stringify(S.running));
 		check(S.coreStatus().server?.state === "active", "not active");
+		check(hiddenOn(base), "the folder is not hidden after the switch");
 		noLeaks();
-		for (const [fault, why] of [["throw-start", "throw"], ["never-lock", "unlocked"]]) {
-			step = `12 server bundle fault ${fault}`;
-			const bytes = fs.readFileSync(path.join(root, `scripts/.build/app-${fault}.js`));
+
+		step = "12 server bundle fault throw-start";
+		{
+			const bytes = fs.readFileSync(path.join(root, "scripts/.build/app-throw-start.js"));
 			const P = publish(server, "app", bytes, { force: true });
 			const id = "server:" + P.sha256.slice(0, 12);
 			await within(S.tick(), 5_000, "tick");
-			check(S.pending?.choice === "server", `${fault}: not waiting`);
+			check(S.pending?.choice === "server", "throw-start: not waiting");
 			S.activationTick();
 			await within(S.switching ?? Promise.resolve(), 5_000, "switch");
 			const bad = coreState(base).bad[id];
-			check(bad?.n === 2 && bad.why === why, `${fault}: not marked bad (${why}): ` + JSON.stringify(bad));
-			check(S.running?.id === BUILTIN && S.current.locked(), `${fault}: the built-in did not take over locked: ` + JSON.stringify(S.running));
-			check(S.coreStatus().server?.state === "bad", `${fault}: server state ` + S.coreStatus().server?.state);
+			check(bad?.n === 2 && bad.why === "throw", "throw-start: not marked bad (throw): " + JSON.stringify(bad));
+			check(S.running?.id === BUILTIN && S.current.locked() && hiddenOn(base), "throw-start: the built-in did not take over locked: " + JSON.stringify(S.running));
+			check(S.coreStatus().server?.state === "bad", "throw-start: server state " + S.coreStatus().server?.state);
 			noLeaks();
 		}
-		server = null;
+
+		step = "12 server bundle never-lock on a hidden folder";
+		const nl = fs.readFileSync(path.join(root, "scripts/.build/app-never-lock.js"));
+		const PN = publish(server, "app", nl, { force: true });
+		const idN = "server:" + PN.sha256.slice(0, 12);
+		await within(S.tick(), 5_000, "tick");
+		check(S.pending?.choice === "server", "never-lock: not waiting");
+		S.activationTick();
+		await within(S.switching ?? Promise.resolve(), 5_000, "switch");
+		check(S.running?.id === idN && S.current.locked() && hiddenOn(base) && !coreState(base).bad[idN], "an app that does not lock, started on a hidden folder (nothing exposed), was refused: " + JSON.stringify({ running: S.running, bad: coreState(base).bad[idN] }));
+		noLeaks();
+
+		step = "12 server bundle never-lock with Private/ visible";
+		// As if unlocked: the folder back under its own name (this app would never hide it).
+		fs.renameSync(path.join(base, H_DIR), path.join(base, V_DIR));
+		check(S.current.locked() === false, "locked() is true while Private/ is visible and nothing covers it");
+		const coversBefore = byId("vlb-cover").length;
+		await within(S.switchTo("server", "test"), 10_000, "switch");
+		const bad = coreState(base).bad[idN];
+		check(bad?.n === 2 && bad.why === "unlocked", "never-lock with Private/ visible: not marked bad (unlocked): " + JSON.stringify(bad));
+		check(S.running?.id === BUILTIN && S.current.locked() && hiddenOn(base), "never-lock: the built-in did not take over and hide the folder: " + JSON.stringify(S.running));
+		check(byId("vlb-cover").length === coversBefore + 1 && byId("vlb-cover").every((e) => e.removed), "the switch over a visible private folder was not covered until it was hidden");
+		check(S.coreStatus().server?.state === "bad", "never-lock: server state " + S.coreStatus().server?.state);
+		noLeaks();
+		await within(S.current.backup.queue ?? Promise.resolve(), 15_000, "reconcile");
 		await stopPlugin(p);
+		server = null;
 	}
 
 	// 13. Re-verified at every start (F.2): a staged bundle runs from the start; changed on disk,
@@ -1546,7 +1856,7 @@ async function main() {
 		fs.writeFileSync(path.join(vb, "Big.bin"), Buffer.alloc(9_000, 2));
 		let beats = 0;
 		const host = {
-			api: 1, app, manifest,
+			api: 2, app, manifest, lockState: () => {},
 			settings: { passHash: "", passSalt: "", passCopied: "", idleMinutes: 5, lockOnBlur: false, privateFolder: "Private", reconcileMinutes: 10, excludes: "", doneCommands: [], commandLog: {}, vaultKey: null, encrypt: true, restoreDeferred: [], ...LOGIN },
 			running: { id: "server:000000000000", kind: "server", version: "0.0.0" },
 			saveSettings: async () => {}, heartbeat: () => { beats++; }, coreStatus: () => ({}), isAborted: () => false,
@@ -1742,15 +2052,18 @@ async function main() {
 		fs.writeFileSync(path.join(base, V_DIR, "Other.md"), "other");
 		fs.writeFileSync(path.join(base, V_DIR, "memo.md"), "a stray, made while locked"); // the real note's name in another case
 		const ev = events(cur);
-		// Obsidian sees each stray go when the merge moves it into the dot folder (as a delete, or
-		// as a rename to the hidden name: neither may send anything), and the emptied folder go.
-		let strayMoves = 0;
+		// The merge moves each stray into the dot folder with Node's fs and then tells Obsidian the
+		// old path is gone (adapter.update): Obsidian sees a delete of each stray, and of the
+		// emptied folder, and must send nothing. It never sees a rename to the hidden name (2.0.0).
+		let strayMoves = 0, strayUpdates = 0;
+		const vAbs = norm(path.join(base, V_DIR)) + "/", hAbs = norm(path.join(base, H_DIR)) + "/";
+		hooks.fs = (name, a) => {
+			if (/^rename/.test(name) && typeof a[0] === "string" && typeof a[1] === "string" && norm(a[0]).startsWith(vAbs) && norm(a[1]).startsWith(hAbs)) strayMoves++;
+			return 0;
+		};
 		hooks.adapter = (name, a) => {
-			if (name === "rename" && a[0].startsWith(V_DIR + "/") && a[1].startsWith(H_DIR + "/")) {
-				strayMoves++;
-				queueMicrotask(() => (a[0].endsWith("Other.md") ? ev.rename(a[1], a[0]) : ev.delete(a[0])));
-			}
-			if (name === "rmdir" && a[0] === V_DIR) queueMicrotask(() => ev.delete(V_DIR, true));
+			if (name === "update" && a[0].startsWith(V_DIR + "/")) { strayUpdates++; queueMicrotask(() => ev.delete(a[0])); }
+			if ((name === "update" || name === "rmdir") && a[0] === V_DIR) queueMicrotask(() => ev.delete(V_DIR, true));
 		};
 		cur.backup.onPaired(false);
 		ev.create("Private/Secret.md");
@@ -1761,7 +2074,8 @@ async function main() {
 		await within(cur.backup.queue, 15_000, "the strays' change events");
 		check(privateWrites(server).length === 0, "something under Private/ was sent while locked: " + privateWrites(server));
 		await unlockApp(cur);
-		check(strayMoves === 3, `${strayMoves} stray(s) moved with adapter.rename (C.9), want 3`);
+		check(strayMoves === 3 && strayUpdates === 3, `${strayMoves} stray(s) moved with Node's fs and ${strayUpdates} adapter.update(Private/…) call(s), want 3 and 3 (C.9, 2.0.0)`);
+		resetHooks();
 		const V = path.join(base, V_DIR);
 		check(fs.readFileSync(path.join(V, "Secret.md"), "utf8") === "secret", "the real note was not decrypted intact: " + listFiles(V));
 		check(fs.existsSync(path.join(V, "Secret (created while locked).md")) && fs.readFileSync(path.join(V, "Secret (created while locked).md"), "utf8") === "", "the stray beside the real note was not kept as 'Secret (created while locked).md': " + listFiles(V));
@@ -2375,9 +2689,7 @@ async function main() {
 		// lifeboat tries again every HIDE_RETRY_MS, like the lock screen, until it is hidden.
 		step = "23 lifeboat: a lock whose folder rename keeps failing for a while";
 		{
-			const until = performance.now() + 3_600; // longer than RENAME_RETRY_MS, shorter than HIDE_RETRY_MS
-			const eperm = () => Object.assign(new Error("EPERM: operation not permitted, rename (test: held by another program)"), { code: "EPERM" });
-			hooks.adapter = (name, a) => { if (name === "rename" && folderRename(a[0], a[1]) === "hide" && performance.now() < until) throw eperm(); return 0; };
+			failFolderRename("hide", 3_600); // longer than RENAME_RETRY_MS, shorter than HIDE_RETRY_MS
 			const t0 = Date.now();
 			await within(lb.lock(), 10_000, "lifeboat lock");
 			check(lb.locked() && lockUp() && fs.existsSync(path.join(base, V_DIR)) && !fs.existsSync(path.join(base, H_DIR)), "the test's failing rename did not fail");
@@ -2585,6 +2897,10 @@ async function main() {
 		await stopPlugin(p);
 		server = null;
 	}
+	// A locked vault with no private folder at all (fresh, or rebuilt): the restore writes none of
+	// its private notes (2.0.0 keeps Obsidian usable while locked, so a note written visible would
+	// be listed until hidden; 1.9.0 wrote them under its cover and hid them after). They are
+	// deferred like the others and arrive at the first reconcile after the unlock.
 	step = "24 restore-all while locked, no .Private/ yet";
 	{
 		const T1 = Date.parse("2026-11-12T08:00:00Z");
@@ -2595,39 +2911,50 @@ async function main() {
 		server = fakeServer({ "_manifest.json": JSON.stringify(idx), "Private/Secret.md": SRV["Secret.md"], "Private/Sub/Deep.md": SRV["Sub/Deep.md"], "_control/commands.json": JSON.stringify([{ id: "ra-4", cmd: "restore-all" }]) });
 		cur.backup.onPaired(false);
 		await within(cur.backup.queue, 15_000, "reconcile");
-		check(p.settings.commandLog["ra-4"]?.ok === true, "restore-all: " + JSON.stringify(p.settings.commandLog["ra-4"]));
+		const log = p.settings.commandLog["ra-4"];
+		check(log?.ok === true && /2 private files deferred/.test(log.detail ?? ""), "restore-all while locked without a hidden folder: " + JSON.stringify(log));
+		check(!fs.existsSync(path.join(base, V_DIR)) && !fs.existsSync(path.join(base, H_DIR)), "a private note was written while locked (Obsidian would list it): " + listFiles(base).filter((f) => /Private/.test(f)));
+		check(p.settings.restoreDeferred.some((d) => d.id === "ra-4") && (readData(base).restoreDeferred ?? []).some((d) => d.id === "ra-4"), "the restore is not recorded as deferred: " + JSON.stringify(p.settings.restoreDeferred));
+		check(privateWrites(server).length === 0, "sent under Private/: " + privateWrites(server));
+		// The unlock finds nothing to show; the reconcile it asks for runs the deferred restore.
+		check(await within(cur.lockScreen.tryUnlock("right"), 60_000, "unlock") === true && cur.lockScreen.locked === false, "the unlock without a private folder");
+		await within(cur.backup.queue, 15_000, "the reconcile after the unlock");
+		const txt = (rel) => fs.readFileSync(path.join(base, V_DIR, rel), "utf8");
+		check(txt("Secret.md") === SRV["Secret.md"] && txt("Sub/Deep.md") === SRV["Sub/Deep.md"] && p.settings.restoreDeferred.length === 0, "the deferred restore did not bring the notes after the unlock: " + listFiles(path.join(base, V_DIR)));
+		check(Math.floor(fs.statSync(path.join(base, V_DIR, "Secret.md")).mtimeMs) === T1, "the restored note does not carry the server copy's time");
+		await within(cur.lock(), 10_000, "lock");
 		await within(cur.finishLock(), 20_000, "finishLock");
-		encryptedOnDisk(base, ["Secret.md", "Sub/Deep.md"], "restored while locked without .Private/: hidden and encrypted");
+		encryptedOnDisk(base, ["Secret.md", "Sub/Deep.md"], "after the lock that followed the deferred restore");
 		const d = await decryptFile(path.join(base, H_DIR, "Secret.md.vlenc"));
 		check(d.plain.toString() === SRV["Secret.md"] && d.mtime === T1, "the restored note was not encrypted with the server copy's time: " + JSON.stringify({ mtime: d.mtime, want: T1 }));
-		check(privateWrites(server).length === 0, "sent under Private/: " + privateWrites(server));
 		await stopPlugin(p);
 		server = null;
 	}
-	// The same, but the folder rename after the restore fails for longer than its retry (a
-	// handle on a just-written file): the files were written, so the command is not a failure;
-	// the lock screen tries again every HIDE_RETRY_MS until the folder is hidden and encrypted.
-	step = "24 restore-all while locked, no .Private/ yet, and the folder rename keeps failing";
+	// A lock that lands as a restore writes a private note (after its last "locked?" check): the
+	// note is never left readable beside the hidden folder; it ends up hidden and encrypted, and
+	// the command counts it as written.
+	step = "24 a lock that lands as a restore writes a private note";
 	{
 		const T1 = Date.parse("2026-11-12T08:00:00Z");
-		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC, null, { before: (b) => fs.rmSync(path.join(b, V_DIR), { recursive: true }) });
+		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC);
 		const cur = S.current;
-		const idx = { "Private/Secret.md": { m: T1, s: Buffer.byteLength(SRV["Secret.md"]) } };
-		server = fakeServer({ "_manifest.json": JSON.stringify(idx), "Private/Secret.md": SRV["Secret.md"], "_control/commands.json": JSON.stringify([{ id: "ra-6", cmd: "restore-all" }]) });
-		const until = performance.now() + 3_600; // longer than RENAME_RETRY_MS, shorter than HIDE_RETRY_MS
-		const eperm = () => Object.assign(new Error("EPERM: operation not permitted, rename (test: held by another program)"), { code: "EPERM" });
-		hooks.adapter = (name, a) => { if (name === "rename" && folderRename(a[0], a[1]) === "hide" && performance.now() < until) throw eperm(); return 0; };
-		const t0 = Date.now();
+		await within(cur.finishLock(), 20_000, "finishLock");
+		await unlockApp(cur);
+		const idx = { "Private/Lost.md": { m: T1, s: 14 } };
+		server = fakeServer({ "_manifest.json": JSON.stringify(idx), "Private/Lost.md": "lost note text", "_control/commands.json": JSON.stringify([{ id: "ra-6", cmd: "restore-all" }]) });
+		let lockedAt = null;
+		hooks.adapter = (name, a) => { if (name === "writeBinary" && a[0] === "Private/Lost.md" && !lockedAt) lockedAt = cur.lock(); return 0; };
 		cur.backup.onPaired(false);
 		await within(cur.backup.queue, 15_000, "reconcile");
-		check(p.settings.commandLog["ra-6"]?.ok === true && /1 files written/.test(p.settings.commandLog["ra-6"].detail ?? ""), "a restore whose files were all written is a failure: " + JSON.stringify(p.settings.commandLog["ra-6"]));
-		check(cur.locked() && fs.existsSync(path.join(base, V_DIR, "Secret.md")) && !fs.existsSync(path.join(base, H_DIR)), "the test's failing rename did not fail");
-		check(cur.privateFolder.stats().hideError, "hideError not set after the failed rename");
-		await waitFor(() => fs.existsSync(path.join(base, H_DIR)) && !fs.existsSync(path.join(base, V_DIR)), 16_000, "the hide retry after the restore");
-		console.log(`[smoke] the restored folder was hidden ${((Date.now() - t0) / 1000).toFixed(1)} s after the restore whose rename failed`);
 		resetHooks();
+		check(lockedAt, "the lock during the write did not happen");
+		await within(lockedAt, 10_000, "the lock");
+		const log = p.settings.commandLog["ra-6"];
+		check(log?.ok === true && /1 files written/.test(log.detail ?? ""), "the note written as the lock landed: " + JSON.stringify(log));
+		check(cur.locked() && !fs.existsSync(path.join(base, V_DIR)), "a readable Private/ was left beside the hidden folder: " + listFiles(path.join(base, V_DIR)));
 		await within(cur.finishLock(), 20_000, "finishLock");
-		encryptedOnDisk(base, ["Secret.md"], "restored while locked, hidden by the retry");
+		encryptedOnDisk(base, ["Secret.md", "Lost.md"], "the note the lock caught");
+		check((await decryptFile(path.join(base, H_DIR, "Lost.md.vlenc"))).plain.toString() === "lost note text", "the caught note's text");
 		check(privateWrites(server).length === 0, "sent under Private/: " + privateWrites(server));
 		await stopPlugin(p);
 		server = null;
@@ -2798,9 +3125,12 @@ async function main() {
 			hooks.fs = (name, a, isAsync) => (isAsync && /^rename/.test(name) ? 100 : 0);
 			hooks.adapter = (name) => (name === "rename" ? 100 : 0);
 		};
+		// Locked the 2.0.0 way: the user-facing state and locked() say so, the folder is hidden, and
+		// no whole-window lock screen is needed for that.
 		const lockedStill = (what) => {
-			check(cur.lockScreen.locked === true && cur.locked() === true && overlayUp(), `${what}: the window is not locked (locked ${cur.lockScreen.locked}, overlay ${overlayUp()})`);
+			check(cur.lockScreen.locked === true && cur.locked() === true && !overlayUp(), `${what}: not locked as it should be (locked ${cur.lockScreen.locked}, locked() ${cur.locked()}, overlay ${overlayUp()})`);
 			check(fs.existsSync(path.join(base, H_DIR)) && !fs.existsSync(path.join(base, V_DIR)), `${what}: the folder was renamed back`);
+			padlockIs(p, true, what);
 		};
 		for (const how of ["lock()", "the quit task"]) {
 			step = `24c ${how} during an unlock`;
@@ -2828,14 +3158,9 @@ async function main() {
 			lockedStill(`${how} during the passphrase check`);
 			const d = disk(base);
 			check(d.plain === 0 && d.tmp === 0 && d.vlenc === 31, `${how} during the passphrase check: something was decrypted: ` + dstr(d));
-			check(errText() === "Locked again.", `the error line after ${how}: ` + JSON.stringify(errText()));
+			// (What the user reads then, "Locked again.", is in the unlock dialog: case 27.)
 		}
-		const eperm = () => Object.assign(new Error("EPERM: operation not permitted, rename (test: held by another program)"), { code: "EPERM" });
-		const failRenameBack = (ms) => {
-			const until = performance.now() + ms;
-			hooks.adapter = (name, a) => { if (name === "rename" && folderRename(a[0], a[1]) === "show" && performance.now() < until) throw eperm(); return 0; };
-			hooks.fs = (name, a) => { if (/^rename/.test(name) && folderRename(a[0], a[1]) === "show" && performance.now() < until) throw eperm(); return 0; };
-		};
+		const failRenameBack = (ms) => failFolderRename("show", ms);
 		// A rename back that fails for a moment (Defender scanning the fresh files) is retried: the unlock succeeds at once.
 		step = "24c the rename back fails for a second";
 		failRenameBack(1_000);
@@ -2858,7 +3183,6 @@ async function main() {
 		console.log(`[smoke] the failing rename was given up after ${(gaveUp / 1000).toFixed(1)} s`);
 		check(gaveUp >= 29_000, `the rename back was given up after ${gaveUp} ms: SHOW_RENAME_RETRY_MS is 30 s`);
 		lockedStill("a rename that keeps failing");
-		check(errText() && !/^Unlocking/.test(errText()), "no error text after the failed unlock: " + JSON.stringify(errText()));
 		hooks.fs = null;
 		hooks.adapter = slowH;
 		const f0 = Date.now();
@@ -2874,13 +3198,632 @@ async function main() {
 		await stopPlugin(p);
 	}
 
+	// 25. locked() means "nothing private is exposed" (F.1, F.4): true while .Private/ is on disk,
+	// or with no private folder at all, or while the fallback lock screen is up; false while
+	// Private/ is visible. It reads the disk, not the user-facing lockScreen.locked. A vault
+	// without Private/ starts the built-in (not the lifeboat) with no cover and no lock screen.
+	step = "25 locked() without a private folder";
+	{
+		const { p, S, base } = await startPlugin(VaultLockPlugin, REAL_PASS, null, { before: (b) => fs.rmSync(path.join(b, V_DIR), { recursive: true }) });
+		const cur = S.current;
+		check(S.running?.id === BUILTIN && !Object.keys(coreState(base).bad).length, "a vault without a private folder did not start the built-in: " + JSON.stringify({ running: S.running, bad: coreState(base).bad }));
+		check(cur.locked() === true && cur.lockScreen.locked === true, `without a private folder: locked() ${cur.locked()}, lockScreen.locked ${cur.lockScreen.locked}`);
+		check(byId("vlb-cover").length === 0 && byCls("vlb-overlay").length === 0 && byId("vlb-lifeboat").length === 0, "a cover or a lock screen over a vault without a private folder");
+		padlockIs(p, true, "without a private folder");
+		noLeaks();
+		await stopPlugin(p);
+	}
+	step = "25 locked() reads the disk";
+	{
+		const { p, S, base, app } = await startPlugin(VaultLockPlugin, REAL_PASS);
+		const cur = S.current;
+		check(cur.locked() === true && hiddenOn(base) && byCls("vlb-overlay").length === 0, "not hidden without a lock screen at start");
+		await unlockApp(cur);
+		check(cur.lockScreen.locked === false && visibleOn(base), "the unlock did not show the folder");
+		// Underneath the app: the folder hidden on disk → nothing exposed; shown again → exposed.
+		fs.renameSync(path.join(base, V_DIR), path.join(base, H_DIR));
+		check(cur.locked() === true, "locked() false although only .Private/ is on disk (nothing exposed)");
+		fs.renameSync(path.join(base, H_DIR), path.join(base, V_DIR));
+		check(cur.locked() === false, "locked() true although Private/ is visible and nothing covers it");
+		await within(cur.lock(), 10_000, "lock");
+		check(cur.locked() === true && cur.lockScreen.locked === true && hiddenOn(base), "not locked and hidden after lock()");
+		check(byCls("vlb-overlay").length === 0 && app.keymap.scopes.length === 0, "a normal lock made a whole-window lock screen or a keymap scope");
+		noLeaks();
+		await stopPlugin(p);
+	}
+
+	// 26. The fallback lock screen (F.4): the folder rename fails for 4 s (longer than
+	// RENAME_RETRY_MS) by both roads: lock() resolves with the whole-window lock screen up and
+	// locked() true; the hide retry (HIDE_RETRY_MS) hides the folder and takes the lock screen down.
+	step = "26 fallback lock screen";
+	{
+		const { p, S, base, app } = await startPlugin(VaultLockPlugin, REAL_PASS);
+		const cur = S.current;
+		await unlockApp(cur);
+		await obsidianSetsTitle("Note - My vault - Obsidian");
+		failFolderRename("hide", 4_000);
+		const t0 = Date.now();
+		await within(cur.lock(), 10_000, "lock whose rename fails");
+		check(overlayUp() && cur.locked() === true && cur.lockScreen.locked === true && visibleOn(base), `the fallback is not up: overlay ${overlayUp()}, locked() ${cur.locked()}, lockScreen.locked ${cur.lockScreen.locked}`);
+		check(app.keymap.scopes.length === 1, "the fallback lock screen does not stop Obsidian's hotkeys (keymap scopes: " + app.keymap.scopes.length + ")");
+		check(cur.privateFolder.stats().hideError, "hideError not set after the failed rename");
+		padlockIs(p, true, "with the fallback up");
+		check(document.title === "Obsidian", "window title not hidden by the fallback lock screen");
+		await obsidianSetsTitle("Other - My vault - Obsidian");
+		check(document.title === "Obsidian", "the fallback lock screen let a note title through");
+		noLeaks();
+		await waitFor(() => hiddenOn(base) && !overlayUp(), 16_000, "the hide retry hiding the folder and taking the fallback down");
+		console.log(`[smoke] the fallback lock screen went ${((Date.now() - t0) / 1000).toFixed(1)} s after the lock whose rename failed`);
+		resetHooks();
+		check(cur.locked() === true && cur.lockScreen.locked === true, "not locked once the retry hid the folder");
+		check(app.keymap.scopes.length === 0, "the fallback went but left Obsidian's hotkeys off (keymap scopes: " + app.keymap.scopes.length + ")");
+		check(cur.privateFolder.stats().hideError === null, "hideError still set after the retry hid the folder");
+		// The title Obsidian asked for while the fallback was up may name a private note (its tab was
+		// open then): it is not put back now the folder is hidden (as the cover never does). The
+		// next title Obsidian sets goes through: nothing guards it any more.
+		check(document.title === "Obsidian", "the fallback went and put back a title from while it was up (it may name a private note): " + document.title);
+		noLeaks();
+		await obsidianSetsTitle("Third - My vault - Obsidian");
+		check(document.title === "Third - My vault - Obsidian", "the window title is still guarded after the fallback went: " + document.title);
+		padlockIs(p, true, "after the retry");
+		await stopPlugin(p);
+	}
+
+	// 27. The unlock dialog (F.5): unlock() opens it; the passphrase typed there goes through
+	// tryUnlock, the folder is decrypted and renamed back, the dialog closes and unlock() resolves;
+	// the padlock opens (host.lockState(false) via setRibbon). A wrong passphrase is said there; a
+	// dismissed dialog leaves it locked; a lock during its unlock wins; a switch closes it.
+	step = "27 unlock dialog";
+	{
+		let orig;
+		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC_LOCAL, null, { before: (b) => { addPrivate(b, 30); orig = snap(path.join(b, V_DIR)); } });
+		const cur = S.current, pf = cur.privateFolder;
+		await within(cur.finishLock(), 20_000, "finishLock");
+		check(disk(base).vlenc === 31, "not all encrypted: " + dstr(disk(base)));
+		const seen = recordProgress(pf);
+		let resolved = false;
+		const u = cur.unlock();
+		void u.then(() => { resolved = true; });
+		await macrotask();
+		const d = unlockDialog();
+		check(!resolved, "unlock() resolved while its dialog is open");
+		submitUnlock(d, "wrong");
+		await waitFor(() => /Wrong passphrase/.test(d.line()), 10_000, '"Wrong passphrase" in the dialog');
+		check(!resolved && openModals.length === 1 && cur.locked() && hiddenOn(base) && disk(base).vlenc === 31, "a wrong passphrase closed the dialog or opened something");
+		padlockIs(p, true, "after a wrong passphrase");
+		submitUnlock(d, "right");
+		await within(u, 60_000, "unlock() resolving once the dialog closed");
+		check(openModals.length === 0, "the dialog is still open after the unlock");
+		check(!cur.locked() && cur.lockScreen.locked === false && visibleOn(base), "not unlocked through the dialog: " + d.line());
+		sameSnap(snap(path.join(base, V_DIR)), orig, "after the unlock through the dialog");
+		check(unlockingN(seen) >= 1, 'the dialog\'s unlock reported no "Unlocking… n of N": ' + JSON.stringify(seen.slice(0, 3)));
+		padlockIs(p, false, "after the unlock through the dialog");
+		check(byCls("vlb-overlay").length === 0, "a whole-window lock screen was made on the way");
+		// unlock() while unlocked: nothing opens.
+		await within(cur.unlock(), 1_000, "unlock() while unlocked");
+		check(openModals.length === 0, "unlock() while unlocked opened a dialog");
+
+		step = "27 the padlock locks and opens the dialog";
+		clickPadlock(p);
+		await waitFor(() => hiddenOn(base), 10_000, "the padlock click to hide the folder");
+		await within(cur.finishLock(), 20_000, "finishLock");
+		check(cur.locked() && disk(base).vlenc === 31 && disk(base).plain === 0, "the padlock's lock: " + dstr(disk(base)));
+		padlockIs(p, true, "after the padlock's lock");
+		clickPadlock(p);
+		await macrotask();
+		unlockDialog().modal.close(); // the closed padlock opened the dialog
+		await macrotask(); // the lock screen lets go of the closed dialog
+		// Dismissed (Esc, a click outside): unlock() resolves, still locked.
+		const u2 = cur.unlock();
+		await macrotask();
+		unlockDialog().modal.close();
+		await within(u2, 1_000, "unlock() after the dialog was dismissed");
+		check(openModals.length === 0 && cur.locked() && hiddenOn(base) && disk(base).vlenc === 31, "a dismissed dialog unlocked something");
+		padlockIs(p, true, "after the dismissed dialog");
+
+		step = "27 a lock during the dialog's unlock";
+		hooks.fs = (name, a, isAsync) => (isAsync && /^rename/.test(name) ? 100 : 0);
+		seen.length = 0;
+		const u3 = cur.unlock();
+		await macrotask();
+		const d3 = unlockDialog();
+		submitUnlock(d3, "right");
+		await waitFor(() => unlockingN(seen) >= 1, 20_000, '"Unlocking… n of N" with n ≥ 1');
+		await within(cur.lock(), 20_000, "lock() during the dialog's unlock");
+		await waitFor(() => /Locked again/.test(d3.line()), 20_000, '"Locked again." in the dialog (it shows why it did not unlock)');
+		resetHooks();
+		check(cur.lockScreen.locked === true && cur.locked() && hiddenOn(base), "the lock during the dialog's unlock did not win");
+		d3.modal.close();
+		await within(u3, 1_000, "unlock() after closing the dialog");
+		await within(cur.finishLock(), 20_000, "finishLock");
+		check(disk(base).plain === 0 && disk(base).vlenc === 31, "after the lock during the dialog's unlock: " + dstr(disk(base)));
+		padlockIs(p, true, "after the lock during the dialog's unlock");
+
+		step = "27 a switch closes the dialog";
+		const u4 = cur.unlock();
+		await macrotask();
+		unlockDialog();
+		await within(S.switchTo("builtin", "test"), 10_000, "switch");
+		await within(u4, 2_000, "unlock() of the stopped app");
+		check(openModals.length === 0, "the dialog of the stopped app is still open (its tryUnlock would answer 'stopping')");
+		check(S.current !== cur && S.current.locked() && hiddenOn(base), "after the switch");
+		padlockIs(p, true, "after the switch");
+		// The new app's dialog unlocks.
+		const u5 = S.current.unlock();
+		await macrotask();
+		submitUnlock(unlockDialog(), "right");
+		await within(u5, 60_000, "the new app's unlock");
+		check(!S.current.locked() && visibleOn(base), "the new app's dialog did not unlock");
+		sameSnap(snap(path.join(base, V_DIR)), orig, "after the new app's unlock");
+		padlockIs(p, false, "after the new app's unlock");
+		await stopPlugin(p);
+	}
+
+	// 28. A 1.9.x app.js (API 1) never runs under this core (F.1, G.2): refused at the pick
+	// ("load"), marked bad, the built-in runs; its createApp is never called. Staged before the
+	// update, and published by the server after it.
+	const API1 = Buffer.from("module.exports = { API: 1, createApp() { globalThis.__vlbApi1Ran = true; throw new Error('an API 1 app ran'); } };\n");
+	step = "28 a staged API 1 app.js at start";
+	{
+		let staged;
+		const { p, S, base } = await startPlugin(VaultLockPlugin, PASS, null, { keys: [TKEY], before: (b) => { staged = stageLocal(b, API1); } });
+		const id = "server:" + staged.p.sha256.slice(0, 12);
+		check(globalThis.__vlbApi1Ran === undefined, "the API 1 app's createApp was called");
+		check(coreState(base).bad[id]?.why === "load", "the API 1 app was not marked bad (load): " + JSON.stringify(coreState(base).bad));
+		check(S.running?.id === BUILTIN && S.current.locked() && hiddenOn(base), "the built-in did not run locked after the refused app: " + JSON.stringify(S.running));
+		check(S.coreStatus().server?.state === "bad", "server state " + S.coreStatus().server?.state);
+		noLeaks();
+		await stopPlugin(p);
+	}
+	step = "28 an API 1 app.js from the server";
+	{
+		const { p, S, base } = await startPlugin(VaultLockPlugin, { ...LOGIN }, null, { keys: [TKEY] });
+		server = fakeServer();
+		const P = publish(server, "app", API1);
+		const id = "server:" + P.sha256.slice(0, 12);
+		await within(S.tick(), 5_000, "tick"); // no passphrase: switched to at once
+		await within(S.switching ?? Promise.resolve(), 5_000, "switch");
+		check(globalThis.__vlbApi1Ran === undefined, "the API 1 app's createApp was called");
+		check(coreState(base).bad[id]?.why === "load" && S.running?.id === BUILTIN, "the API 1 bundle: " + JSON.stringify({ bad: coreState(base).bad[id], running: S.running }));
+		await stopPlugin(p);
+		server = null;
+	}
+	// host.lockState from app.js itself (the contract, as the core sees it): true once the start
+	// has locked, false after an unlock, true after a lock.
+	step = "28 host.lockState";
+	freshDocument();
+	{
+		const mod = evaluate("app.js");
+		const { app, base } = makeVault(null);
+		const states = [];
+		const host = {
+			api: 2, app, manifest, lockState: (b) => { states.push(b); },
+			settings: { passHash: REAL_PASS.passHash, passSalt: REAL_PASS.passSalt, passCopied: "", idleMinutes: 5, lockOnBlur: false, privateFolder: "Private", webdavUrl: "", webdavUser: "", webdavPass: "", reconcileMinutes: 10, excludes: "", doneCommands: [], commandLog: {}, vaultKey: null, encrypt: true, restoreDeferred: [], recoveryPaths: [] },
+			running: { id: "server:000000000000", kind: "server", version: "0.0.0" },
+			saveSettings: async () => {}, heartbeat: () => {}, coreStatus: () => ({}), isAborted: () => false,
+		};
+		const a = mod.createApp(host);
+		a.load();
+		await within(a.start(), 10_000, "app start");
+		check(a.locked() && hiddenOn(base) && states.at(-1) === true, "host.lockState after a start with a passphrase: " + JSON.stringify(states));
+		check(await within(a.lockScreen.tryUnlock("right"), 60_000, "unlock") === true && states.at(-1) === false && visibleOn(base), "host.lockState after the unlock: " + JSON.stringify(states));
+		await within(a.lock(), 10_000, "lock");
+		check(states.at(-1) === true && hiddenOn(base), "host.lockState after the lock: " + JSON.stringify(states));
+		await within(a.stop(), 5_000, "app stop");
+		a.unload();
+		noHiddenPaths();
+	}
+
+	// 29. Obsidian never learns a .Private path (the stale-path fix): every rename into the hidden
+	// folder (the folder at a lock, each stray the merge moves) goes through Node's fs, and then
+	// adapter.update(old path) tells Obsidian the old path is gone. Obsidian's own adapter.rename
+	// would index the hidden paths and announce them: links, bookmarks and tab history would
+	// follow them there, and a link to Private/x could open the plaintext .Private/x. Without
+	// adapter.update (undocumented) the folder is hidden all the same.
+	const vaultPath = (base, rel) => norm(path.join(base, rel));
+	/** The first fs rename from → to (vault paths) in ops, from index i; -1 if none. */
+	const fsRename = (ops, base, from, to, i = 0) => ops.findIndex((o, j) => j >= i && /^rename/.test(o[0]) && o[1] === vaultPath(base, from) && o[2] === vaultPath(base, to));
+	const updateOf = (ops, rel, i = 0) => ops.findIndex((o, j) => j >= i && o[0] === "adapter.update" && o[1] === rel);
+	step = "29 the lock: fs rename, then adapter.update";
+	{
+		const ops = [];
+		const { p, S, base, app } = await startPlugin(VaultLockPlugin, ENC_LOCAL, null, { before: () => { hooks.log = ops; } });
+		const cur = S.current;
+		check(cur.locked() && hiddenOn(base), "not hidden at start");
+		let r = fsRename(ops, base, V_DIR, H_DIR);
+		check(r >= 0, "the folder was not renamed with Node's fs at the start's lock: " + JSON.stringify(ops.filter((o) => /rename/.test(o[0]))));
+		check(updateOf(ops, V_DIR, r) > r, "no adapter.update(\"Private\") after the folder's fs rename");
+		check(!ops.some((o) => o[0] === "adapter.rename" && isHiddenRel(o[2])), "adapter.rename into the hidden folder");
+		noHiddenPaths("at the start's lock");
+		await within(cur.finishLock(), 20_000, "finishLock");
+		await unlockApp(cur);
+		const m = ops.length;
+		await within(cur.lock(), 10_000, "lock");
+		r = fsRename(ops, base, V_DIR, H_DIR, m);
+		check(r >= 0 && updateOf(ops, V_DIR, r) > r, "the lock after an unlock: no fs rename + adapter.update(\"Private\")");
+		noHiddenPaths("at a lock");
+
+		step = "29 strays merged at the unlock";
+		await within(cur.finishLock(), 20_000, "finishLock");
+		fs.mkdirSync(path.join(base, V_DIR, "New"), { recursive: true });
+		fs.writeFileSync(path.join(base, V_DIR, "Stray.md"), "made while locked");
+		fs.writeFileSync(path.join(base, V_DIR, "New", "Deep.md"), "made while locked, in a folder the private folder does not have");
+		const m2 = ops.length;
+		await unlockApp(cur);
+		for (const rel of ["Stray.md", "New/Deep.md"]) {
+			const i = fsRename(ops, base, `${V_DIR}/${rel}`, `${H_DIR}/${rel}`, m2);
+			check(i >= 0, `the stray ${rel} was not moved with Node's fs: ` + JSON.stringify(ops.slice(m2).filter((o) => /rename/.test(o[0]))));
+			check(updateOf(ops, `${V_DIR}/${rel}`, i) > i, `no adapter.update("${V_DIR}/${rel}") after the stray's move`);
+		}
+		noHiddenPaths("at the stray merge of an unlock (a folder under .Private made through the adapter counts too)");
+		check(fs.readFileSync(path.join(base, V_DIR, "Stray.md"), "utf8") === "made while locked" && fs.existsSync(path.join(base, V_DIR, "New", "Deep.md")) && fs.readFileSync(path.join(base, V_DIR, "Secret.md"), "utf8") === "secret", "after the merge and the unlock: " + listFiles(path.join(base, V_DIR)));
+
+		step = "29 Obsidian without adapter.update";
+		Object.defineProperty(app.vault.adapter, "update", { value: undefined, configurable: true, writable: true });
+		const m3 = ops.length;
+		await within(cur.lock(), 10_000, "lock");
+		check(cur.locked() && hiddenOn(base) && !overlayUp(), "without adapter.update the lock did not hide the folder");
+		check(fsRename(ops, base, V_DIR, H_DIR, m3) >= 0 && !ops.slice(m3).some((o) => o[0] === "adapter.update"), "without adapter.update: " + JSON.stringify(ops.slice(m3).filter((o) => /rename|update/.test(o[0]))));
+		noHiddenPaths("without adapter.update");
+		await within(cur.finishLock(), 20_000, "finishLock");
+		encryptedOnDisk(base, ["Secret.md", "Stray.md", "New/Deep.md"], "without adapter.update");
+		hooks.log = null;
+		await stopPlugin(p);
+	}
+	step = "29 strays merged at a start that finds both folders";
+	{
+		const ops = [];
+		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC_LOCAL, null, { before: (b) => {
+			// Locked by an earlier run (.Private/ on disk), and strays beside it from a link clicked then.
+			fs.renameSync(path.join(b, V_DIR), path.join(b, H_DIR));
+			fs.mkdirSync(path.join(b, V_DIR, "Sub"), { recursive: true });
+			fs.writeFileSync(path.join(b, V_DIR, "Other.md"), "other");
+			fs.writeFileSync(path.join(b, V_DIR, "Sub", "Deep.md"), "deep");
+			hooks.log = ops;
+		} });
+		const cur = S.current;
+		check(cur.locked() && hiddenOn(base), "not hidden after the start's merge");
+		for (const rel of ["Other.md", "Sub/Deep.md"]) {
+			const i = fsRename(ops, base, `${V_DIR}/${rel}`, `${H_DIR}/${rel}`);
+			check(i >= 0 && updateOf(ops, `${V_DIR}/${rel}`, i) > i, `the start's merge of ${rel}: no fs rename + adapter.update`);
+		}
+		noHiddenPaths("at the start's stray merge");
+		await within(cur.finishLock(), 20_000, "finishLock");
+		encryptedOnDisk(base, ["Secret.md", "Other.md", "Sub/Deep.md"], "after the start's merge");
+		hooks.log = null;
+		await stopPlugin(p);
+	}
+
+	// 30. Hide only (encryption off, as on a new computer since the server writes "encrypt": false
+	// at pairing; with and without a key): the lock hides without encrypting, locked() is true
+	// while hidden, nothing under the hidden folder reaches the server, the unlock shows every
+	// byte and mtime as it was, strays merge the same way, and Obsidian is never told the hidden
+	// name (the plaintext is right there). File recovery is "unavailable" here (no IndexedDB).
+	for (const [label, data] of [["with a key", { ...ENC, encrypt: false }], ["without a key", { ...REAL_PASS, ...LOGIN, encrypt: false }]]) {
+		step = `30 hide only (${label})`;
+		let orig;
+		const { p, S, base } = await startPlugin(VaultLockPlugin, data, null, { before: (b) => { addPrivate(b, 5); orig = snap(path.join(b, V_DIR)); } });
+		const cur = S.current, pf = cur.privateFolder;
+		server = fakeServer({ "_control/config.json": JSON.stringify({ encrypt: false }), ...(data.vaultKey ? { [KEY_FILE]: keyJson() } : {}) });
+		await within(cur.finishLock(), 20_000, "finishLock");
+		let d = disk(base);
+		check(cur.locked() && hiddenOn(base) && !overlayUp() && d.vlenc === 0 && d.plain === 6 && d.tmp === 0, "hide only: " + dstr(d));
+		check(pf.stats().on === false && p.settings.encrypt === false, "encryption is on: " + JSON.stringify(pf.stats()));
+		padlockIs(p, true, "hide only, locked");
+		cur.backup.onPaired(false);
+		await within(cur.backup.queue, 15_000, "reconcile");
+		check(![...server.files.keys()].some((k) => k.startsWith(H_DIR) || k.startsWith(V_DIR + "/")) && privateWrites(server).length === 0, "the hidden plaintext reached the server while locked: " + [...server.files.keys()]);
+		const enc = server.json("_control/status.json").encryption;
+		check(enc?.on === false && enc.fileRecovery === "unavailable", "status.json encryption (on, fileRecovery): " + JSON.stringify(enc));
+		check(disk(base).vlenc === 0, "a reconcile with encrypt:false encrypted: " + dstr(disk(base)));
+		// A stray made while locked comes in at the unlock.
+		fs.mkdirSync(path.join(base, V_DIR));
+		fs.writeFileSync(path.join(base, V_DIR, "New.md"), "made while locked");
+		await unlockApp(cur);
+		check(visibleOn(base) && fs.readFileSync(path.join(base, V_DIR, "New.md"), "utf8") === "made while locked", "the stray did not come in: " + listFiles(path.join(base, V_DIR)));
+		const back = snap(path.join(base, V_DIR));
+		delete back["New.md"];
+		sameSnap(back, orig, "hide only, after the unlock");
+		padlockIs(p, false, "hide only, unlocked");
+		await within(cur.backup.queue, 15_000, "reconcile after the unlock");
+		await within(cur.lock(), 10_000, "lock");
+		await within(cur.finishLock(), 20_000, "finishLock");
+		d = disk(base);
+		check(cur.locked() && hiddenOn(base) && d.vlenc === 0 && d.plain === 7, "hide only, the second lock: " + dstr(d));
+		await unlockApp(cur, "the second unlock");
+		check(fs.readFileSync(path.join(base, V_DIR, "New.md"), "utf8") === "made while locked", "after the second unlock");
+		await within(cur.backup.queue, 15_000, "reconcile after the second unlock");
+		await stopPlugin(p);
+		server = null;
+	}
+
+	// 31. Private/ comes back while locked (a note created there, a link clicked, a folder made by
+	// hand, since Obsidian stays usable): lock(), the idle check and the quit task hide it like a
+	// lock would. Before, lock() returned at once while `locked` was true, and the folder stayed
+	// visible and plaintext until the next start. The unlock dialog, if open, stays; other open
+	// dialogs go at every hide (one may show a private note's text), Settings stays. A stray whose
+	// move keeps failing puts the fallback up, over pop-out windows too, until the retry hides it.
+	step = "31 Private/ made while locked: lock() hides it";
+	{
+		const { p, S, base, app } = await startPlugin(VaultLockPlugin, ENC_LOCAL, null, { before: (b) => fs.rmSync(path.join(b, V_DIR), { recursive: true }) });
+		const cur = S.current;
+		check(cur.locked() && cur.lockScreen.locked && !fs.existsSync(path.join(base, H_DIR)), "not locked without a private folder");
+		const stray = (name) => { fs.mkdirSync(path.join(base, V_DIR), { recursive: true }); fs.writeFileSync(path.join(base, V_DIR, name), "made while locked"); };
+		stray("One.md");
+		const tab = leaf(app, { file: `${V_DIR}/One.md` });
+		check(!cur.locked() && cur.lockScreen.locked, "locked() true with Private/One.md visible");
+		padlockIs(p, true, "with a stray");
+		// The padlock was clicked: the unlock dialog is open and stays through the lock. Other dialogs go; Settings stays.
+		const u = cur.unlock();
+		await macrotask();
+		unlockDialog();
+		const history = new obsidian.Modal(app);
+		history.open();
+		const settings = new obsidian.Modal(app);
+		settings.modalEl.addClass("mod-settings");
+		settings.open();
+		await within(cur.lock(), 10_000, "lock() with a stray");
+		check(hiddenOn(base) && cur.locked() && fs.existsSync(path.join(base, H_DIR, "One.md")), "lock() did not hide the stray: " + listFiles(base).filter((f) => /Private/.test(f)).join(", "));
+		check(tab.detached, "the stray's tab was not closed");
+		check(!history.__open, "a dialog open at the lock stayed open (it may show a private note's text)");
+		check(settings.__open, "the lock closed Settings");
+		check(openModals.length === 2 && /Unlock private folder/.test(openModals[0].titleEl.__rec.text), "the lock closed the unlock dialog: " + openModals.length + " dialog(s) open");
+		settings.close();
+		openModals[0].close();
+		await within(u, 1_000, "unlock() after the dialog was closed");
+		await within(cur.finishLock(), 20_000, "finishLock");
+		encryptedOnDisk(base, ["One.md"], "the stray after lock()");
+
+		step = "31 the idle check hides it";
+		stray("Two.md");
+		p.settings.idleMinutes = 1;
+		cur.lockScreen.lastActivity = Date.now() - 2 * MIN;
+		cur.lockScreen.checkIdle();
+		await waitFor(() => hiddenOn(base), 10_000, "the idle check hiding the stray");
+		await within(cur.lockScreen.inflight ?? Promise.resolve(), 10_000, "the idle lock");
+		check(cur.locked() && fs.existsSync(path.join(base, H_DIR, "Two.md")), "after the idle check: " + dstr(disk(base)));
+		await within(cur.finishLock(), 20_000, "finishLock");
+
+		step = "31 the quit task hides it";
+		stray("Three.md");
+		await within(quit(app), 20_000, "the quit task");
+		check(hiddenOn(base), "the quit left Private/ visible: " + listFiles(base).filter((f) => /Private/.test(f)).join(", "));
+		encryptedOnDisk(base, ["One.md", "Two.md", "Three.md"], "after the quit task");
+		padlockIs(p, true, "after the strays");
+
+		step = "31 a stray whose move keeps failing: the fallback, pop-outs covered, then the retry";
+		stray("Four.md");
+		const pop = popoutWindow();
+		leaf(app, { file: "Note.md", doc: pop.document, win: pop });
+		const popCover = (d) => created.find((e) => e.cls === "vlb-popout-cover" && inside(e, d.__rec));
+		const until = performance.now() + 4_000; // longer than FS_RETRY_MS, shorter than HIDE_RETRY_MS
+		hooks.fs = (name, a) => { if (/^rename/.test(name) && typeof a[0] === "string" && norm(a[0]).endsWith("/Private/Four.md") && performance.now() < until) throw eperm(); return 0; };
+		const t0 = Date.now();
+		await within(cur.lock(), 10_000, "lock() whose stray move fails");
+		check(overlayUp() && cur.locked() && cur.lockScreen.locked && fs.existsSync(path.join(base, V_DIR, "Four.md")), `the fallback is not up: overlay ${overlayUp()}, locked() ${cur.locked()}`);
+		check(cur.privateFolder.stats().hideError, "hideError not set after the failed move");
+		check(popCover(pop.document)?.isConnected && pop.document.body.__rec.classes.has("vlb-locked"), "the pop-out window is not covered under the fallback (a click there would open the plaintext note)");
+		check(pop.document.title === "Obsidian", "the pop-out's title is not guarded: " + pop.document.title);
+		// A window opened under the fallback is covered too.
+		const pop2 = popoutWindow();
+		for (const h of app.handlers["window-open"] ?? []) h(null, pop2);
+		check(popCover(pop2.document)?.isConnected && pop2.document.body.__rec.classes.has("vlb-locked"), "a pop-out opened under the fallback is not covered");
+		noLeaks();
+		await waitFor(() => hiddenOn(base) && !overlayUp(), 16_000, "the hide retry moving the stray and taking the fallback down");
+		console.log(`[smoke] the fallback went ${((Date.now() - t0) / 1000).toFixed(1)} s after the lock whose stray move failed`);
+		resetHooks();
+		check(cur.locked() && fs.existsSync(path.join(base, H_DIR, "Four.md")) && cur.privateFolder.stats().hideError === null, "after the retry: " + dstr(disk(base)));
+		check(!popCover(pop.document).isConnected && !pop.document.body.__rec.classes.has("vlb-locked") && !popCover(pop2.document).isConnected, "a pop-out cover stayed after the fallback went");
+		check(app.keymap.scopes.length === 0, "keymap scopes after the fallback went: " + app.keymap.scopes.length);
+		await within(cur.finishLock(), 20_000, "finishLock");
+		encryptedOnDisk(base, ["One.md", "Two.md", "Three.md", "Four.md"], "after the retry");
+		await stopPlugin(p);
+	}
+
+	// 32. File recovery keeps its snapshots by path and never moves them: a note written at the
+	// vault root and then dragged into the private folder leaves readable snapshots under its old
+	// path. The app remembers where notes (and folders) moved into the folder came from, saves the
+	// list (a restart still knows), and deletes those rows at the next lock with the folder's own.
+	// Moves inside the folder or out of it, and repeats, record nothing; the list is capped.
+	const FR_DB = "smoke-backup"; // the stub app's appId + "-backup"
+	const frRows = (dbs) => [...dbs[FR_DB].stores.backups.rows.values()].map((v) => v.path).sort();
+	const frInstall = (dbs) => { globalThis.indexedDB = fakeIDB(dbs).factory; globalThis.IDBKeyRange = KeyRange; };
+	const frRemove = () => { delete globalThis.indexedDB; delete globalThis.IDBKeyRange; };
+	const tfile = (p) => Object.assign(new obsidian.TFile(), { path: p });
+	const tfolder = (p) => Object.assign(new obsidian.TFolder(), { path: p });
+	step = "32 File recovery: the old paths of notes moved into the private folder";
+	{
+		const dbs = { [FR_DB]: backupsDb(["Private/Secret.md", "Private/Sub/Deep.md", "Diary.md", "Drafts/Plan.md", "Welcome.md"]) };
+		frInstall(dbs);
+		try {
+			const { p, S, base } = await startPlugin(VaultLockPlugin, ENC_LOCAL);
+			const cur = S.current;
+			await waitFor(() => cur.fileRecovery && cur.fileRecovery !== "unavailable", 5_000, "the start's File recovery clean-up");
+			check(cur.fileRecovery.deleted === 2 && frRows(dbs).join() === ["Diary.md", "Drafts/Plan.md", "Welcome.md"].join(), "the start's clean-up: " + JSON.stringify({ fileRecovery: cur.fileRecovery, rows: frRows(dbs) }));
+			await within(cur.finishLock(), 20_000, "finishLock");
+			await unlockApp(cur);
+			cur.noteMoved(tfile("Private/Diary.md"), "Diary.md"); // a note moved in
+			cur.noteMoved(tfile("Private/Drafts/Sub/Deep.md"), "Drafts/Sub/Deep.md"); // a folder moved in: Obsidian reports its notes too, before or after it
+			cur.noteMoved(tfolder("Private/Drafts"), "Drafts");
+			cur.noteMoved(tfile("Private/Drafts/Plan.md"), "Drafts/Plan.md");
+			cur.noteMoved(tfile("Private/Renamed.md"), "Private/Diary.md"); // renamed inside the folder: nothing to remember
+			cur.noteMoved(tfile("Public.md"), "Private/Out.md"); // moved out: nothing
+			cur.noteMoved(tfile("Private/Diary.md"), "Diary.md"); // again: once
+			check(JSON.stringify(p.settings.recoveryPaths) === JSON.stringify(["Diary.md", "Drafts/"]), "recoveryPaths (the folder's entry covers its notes): " + JSON.stringify(p.settings.recoveryPaths));
+			await waitFor(() => JSON.stringify(readData(base).recoveryPaths ?? null) === JSON.stringify(p.settings.recoveryPaths), 3_000, "recoveryPaths saved to data.json");
+			check(frRows(dbs).includes("Diary.md"), "the old path's rows went before the lock");
+			await within(cur.lock(), 10_000, "lock");
+			await waitFor(() => !frRows(dbs).includes("Diary.md"), 5_000, "the lock's clean-up of the old paths");
+			await waitFor(() => p.settings.recoveryPaths.length === 0, 3_000, "recoveryPaths cleared after the clean-up");
+			check(frRows(dbs).join() === "Welcome.md" && cur.fileRecovery.deleted === 2, "after the lock: " + JSON.stringify({ rows: frRows(dbs), fileRecovery: cur.fileRecovery }));
+			check((readData(base).recoveryPaths ?? null)?.length === 0, "data.json still lists the cleaned paths: " + JSON.stringify(readData(base).recoveryPaths));
+			// The cap, and the save pending at a stop.
+			for (let i = 0; i < 250; i++) cur.noteMoved(tfile(`Private/n${i}.md`), `n${i}.md`);
+			check(p.settings.recoveryPaths.length === 200 && p.settings.recoveryPaths[0] === "n50.md", "the cap: " + p.settings.recoveryPaths.length + " entries, first " + p.settings.recoveryPaths[0]);
+			await stopPlugin(p);
+			check((readData(base).recoveryPaths ?? []).length === 200, "the save pending at the stop was not flushed");
+			// A restart while locked still cleans them, with new private rows.
+			dbs[FR_DB].stores.backups.rows.set(1000, { path: "n77.md", ts: 1, data: "x" });
+			dbs[FR_DB].stores.backups.rows.set(1001, { path: "Private/Late.md", ts: 1, data: "x" });
+			const q = await restartOn(base, VaultLockPlugin);
+			const cur2 = q.S.current;
+			await waitFor(() => cur2.fileRecovery && cur2.fileRecovery !== "unavailable", 5_000, "the restart's clean-up");
+			check(cur2.fileRecovery.deleted === 2 && frRows(dbs).join() === "Welcome.md", "the restart's clean-up: " + JSON.stringify({ rows: frRows(dbs), fileRecovery: cur2.fileRecovery }));
+			await waitFor(() => q.p.settings.recoveryPaths.length === 0 && (readData(base).recoveryPaths ?? [1]).length === 0, 3_000, "recoveryPaths cleared after the restart's clean-up");
+			await stopPlugin(q.p);
+		} finally {
+			frRemove();
+		}
+	}
+
+	// 33. The folder on disk is spelled "private" while the setting says "Private" (made by hand on
+	// a disk that ignores case, as Windows and macOS do): Obsidian lists it as "private", so the
+	// tabs to close, the path to tell Obsidian about and File recovery's rows all go by the disk's
+	// spelling; the unlock brings it back under the setting's. Skipped on a disk that tells them apart.
+	step = "33 the folder spelled differently on disk";
+	{
+		const dbs = { [FR_DB]: backupsDb(["private/Secret.md", "Private/Other.md", "Welcome.md"]) };
+		frInstall(dbs);
+		const ops = [];
+		let tab = null, caseless = false;
+		try {
+			const { p, S, base } = await startPlugin(VaultLockPlugin, ENC_LOCAL, null, { before: (b, app) => {
+				caseless = fs.existsSync(path.join(b, "PRIVATE"));
+				if (!caseless) return;
+				fs.renameSync(path.join(b, V_DIR), path.join(b, "private"));
+				tab = leaf(app, { file: "private/Secret.md" });
+				hooks.log = ops;
+			} });
+			if (!caseless) {
+				console.log("[smoke] 33 skipped: this disk tells Private from private");
+			} else {
+				const cur = S.current;
+				check(cur.locked() && hiddenOn(base) && fs.existsSync(path.join(base, H_DIR, "Secret.md")), "the folder spelled 'private' was not hidden: " + listFiles(base).filter((f) => /private/i.test(f)).join(", "));
+				check(tab.detached, "the tab of private/Secret.md was not closed");
+				check(ops.some((o) => o[0] === "adapter.update" && o[1] === "private"), "Obsidian was not told that 'private' is gone: " + JSON.stringify(ops.filter((o) => o[0] === "adapter.update")));
+				await waitFor(() => cur.fileRecovery && cur.fileRecovery !== "unavailable", 5_000, "the clean-up");
+				check(frRows(dbs).join() === "Welcome.md", "File recovery's rows under 'private/' stayed: " + frRows(dbs));
+				await within(cur.finishLock(), 20_000, "finishLock");
+				encryptedOnDisk(base, ["Secret.md"], "spelled 'private'");
+				await unlockApp(cur);
+				check(fs.existsSync(path.join(base, V_DIR, "Secret.md")) && fs.readFileSync(path.join(base, V_DIR, "Secret.md"), "utf8") === "secret", "the unlock did not bring the folder back");
+				noHiddenPaths("with the folder spelled 'private'");
+			}
+			hooks.log = null;
+			await stopPlugin(p);
+		} finally {
+			hooks.log = null;
+			frRemove();
+		}
+	}
+
+	// 34. Which tabs a lock closes: the private notes' own tabs, also when the tab was not opened
+	// since the start (a deferred view: no file, only its saved state); not the sidebar's linked
+	// panes (Backlinks, Outline, …), whose file is the active note and which follow the next note by
+	// themselves, nor a public tab. At a locked start the layout loads after the lock, so the tabs
+	// it brings back go once it is ready (closePrivateLeaves), under either name.
+	step = "34 tabs at a lock: deferred tabs go, linked panes stay";
+	{
+		const { p, S, base, app } = await startPlugin(VaultLockPlugin, ENC_LOCAL);
+		const cur = S.current;
+		await within(cur.finishLock(), 20_000, "finishLock");
+		await unlockApp(cur);
+		const note = leaf(app, { file: `${V_DIR}/Secret.md` });
+		const pub = leaf(app, { file: "Note.md" });
+		const backlinks = leaf(app, { file: `${V_DIR}/Secret.md`, navigation: false, sidebar: true });
+		const outline = leaf(app, { file: `${V_DIR}/Secret.md`, navigation: false }); // a linked pane dragged into the main area
+		const deferred = leaf(app, { state: { file: `${V_DIR}/Sub/x.md` } });
+		const deferredPane = leaf(app, { state: { file: `${V_DIR}/Secret.md` }, sidebar: true });
+		const deferredPub = leaf(app, { state: { file: "Note.md" } });
+		const empty = leaf(app, { state: {} });
+		await within(cur.lock(), 10_000, "lock");
+		check(note.detached && deferred.detached, `the private tabs were not closed: note ${note.detached}, deferred ${deferred.detached}`);
+		check(!backlinks.detached && !outline.detached && !deferredPane.detached, `a linked pane was closed: backlinks ${backlinks.detached}, outline ${outline.detached}, deferred pane ${deferredPane.detached}`);
+		check(!pub.detached && !deferredPub.detached && !empty.detached, "a public or empty tab was closed");
+		step = "34 private tabs brought back by the layout at a locked start";
+		const old = leaf(app, { state: { file: `${H_DIR}/Old.md` } }); // from a 1.9.0 workspace.json
+		const late = leaf(app, { state: { file: `${V_DIR}/Secret.md` } });
+		const latePane = leaf(app, { state: { file: `${V_DIR}/Secret.md` }, sidebar: true });
+		await within(cur.privateFolder.closePrivateLeaves(), 5_000, "closePrivateLeaves");
+		check(old.detached && late.detached, `the tabs the layout brought back were not closed: old ${old.detached}, late ${late.detached}`);
+		check(!latePane.detached && !pub.detached && !deferredPub.detached, "closePrivateLeaves closed a pane or a public tab");
+		await within(cur.finishLock(), 20_000, "finishLock");
+		await stopPlugin(p);
+	}
+
+	// 35. A switch while the unlock dialog is open: the dialog closes the moment the app begins to
+	// stop, not after the stop has waited for the backup's last run (up to the core's bound), so
+	// the right passphrase typed meanwhile is not answered "Wrong passphrase". A passphrase that
+	// still reaches the stopping app is told it is restarting.
+	step = "35 a switch closes the dialog at once";
+	{
+		const { p, S, base } = await startPlugin(VaultLockPlugin, ENC_LOCAL);
+		const cur = S.current, pf = cur.privateFolder;
+		await within(cur.finishLock(), 20_000, "finishLock");
+		const u = cur.unlock();
+		await macrotask();
+		unlockDialog();
+		// The stop waits for the vault chain (a pass under way): hold it.
+		const hold = gate();
+		void pf.serial(() => hold.p);
+		const sw = S.switchTo("builtin", "test");
+		await macrotask();
+		await macrotask();
+		check(cur.stopping && S.current === null, "the switch has not begun stopping the app");
+		check(openModals.length === 0, "the dialog is still open while the app waits for its stop");
+		await within(u, 1_000, "unlock() of the stopping app");
+		const said = [];
+		check(await within(cur.lockScreen.tryUnlock("right", (t) => said.push(t)), 20_000, "tryUnlock while stopping") === true, "the right passphrase was answered as wrong while stopping");
+		check(said.some((t) => /restarting/i.test(t)), "no word about the restart: " + JSON.stringify(said));
+		check(hiddenOn(base) && cur.lockScreen.locked, "the stopping app opened the folder");
+		hold.release();
+		await within(sw, 15_000, "switch");
+		check(S.current && S.current !== cur && S.current.locked() && hiddenOn(base), "after the switch");
+		padlockIs(p, true, "after the switch");
+		await stopPlugin(p);
+	}
+
+	// 36. A cover left behind by the copy before (1.9.x left one at every locked reload; 2.0.0 only
+	// over a visible folder) over a folder that is hidden: it hides nothing, so the next copy takes
+	// it down at once instead of leaving the window blank, with every key swallowed, until its own
+	// 5 s timer (G.2).
+	step = "36 a cover left over a hidden folder goes at the next load";
+	{
+		const { p, S, base, app } = await startPlugin(VaultLockPlugin, REAL_PASS);
+		check(S.current.locked() && hiddenOn(base), "not hidden");
+		await stopPlugin(p);
+		// What the unloaded copy leaves: the cover, its key swallow, a keymap scope and the timer.
+		p.supervisor.cover.leaveBehind(5_000);
+		const left = globalThis.__vaultLock?.cover;
+		check(left && left.el.isConnected && app.keymap.scopes.length === 1, "no cover was left to take over");
+		const cleared = [];
+		const realClearTimeout = globalThis.clearTimeout;
+		globalThis.clearTimeout = (id) => { cleared.push(id); return realClearTimeout(id); };
+		let p2;
+		try {
+			p2 = new VaultLockPlugin(app, manifest);
+			await within(p2.load(), 10_000, "onload");
+		} finally {
+			globalThis.clearTimeout = realClearTimeout;
+		}
+		await macrotask();
+		check(!left.el.isConnected && !globalThis.__vaultLock?.cover, "the left cover stayed over the hidden folder (the window stays blank until its timer)");
+		check(cleared.includes(left.timer), "the left cover's timer was not cleared");
+		check(app.keymap.scopes.length === 0, "the left cover's keymap scope is still pushed (Obsidian's hotkeys dead): " + app.keymap.scopes.length);
+		check(p2.supervisor.current?.locked() && hiddenOn(base) && byId("vlb-cover").every((e) => !e.isConnected), "after the load");
+		noLeaks();
+		await stopPlugin(p2);
+	}
+
 	// 7. Nothing touched the network outside the steps with a server.
 	step = "7 no network";
+	noHiddenPaths();
 	check(netCalls === 0, `requestUrl was called ${netCalls} times`);
 	check(cachedGets.length === 0, "GET without Cache-Control: no-cache: " + [...new Set(cachedGets)].join(", "));
 }
 
-const guard = setTimeout(() => { console.error(`smoke test FAILED at ${step}: timed out`); process.exit(1); }, 300_000);
+// 2.0.0 added cases that wait for the 10 s hide retry; Windows runners are slower.
+const guard = setTimeout(() => { console.error(`smoke test FAILED at ${step}: timed out`); process.exit(1); }, 480_000);
 function cleanUp() {
 	for (const v of vaults) {
 		try { fs.rmSync(v, { recursive: true, force: true }); } catch (e) { console.warn("could not remove", v, e.message); }

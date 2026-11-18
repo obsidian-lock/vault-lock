@@ -19,11 +19,12 @@ export class PassphraseModal extends Modal {
 		const s = this.owner.settings;
 		const changing = !!s.passHash;
 		const { contentEl } = this;
+		this.modalEl.addClass("vlb-passphrase"); // the lock closes other dialogs, not this one
 		this.titleEl.setText(changing ? "Change passphrase" : "Choose a passphrase");
 		contentEl.createEl("p", {
 			text: changing
 				? "Enter your current passphrase, then the new one twice."
-				: "You will type it to unlock this vault. The vault locks when Obsidian starts and after a few idle minutes. Your notes are backed up automatically.",
+				: "You will type it to unlock the private folder. It locks when Obsidian starts and after a few idle minutes. Your notes are backed up automatically.",
 		});
 
 		let current = "", next = "", confirm = "";
@@ -60,7 +61,7 @@ export class PassphraseModal extends Modal {
 			} finally {
 				this.busy = false;
 			}
-			new Notice(changing ? "Passphrase changed." : "Passphrase saved. Don't forget it: you need it to unlock this vault.", 8000);
+			new Notice(changing ? "Passphrase changed." : "Passphrase saved. Don't forget it: you need it to unlock the private folder.", 8000);
 			this.close();
 			this.onSaved?.();
 		};

@@ -31,8 +31,9 @@ test("pick: the precedence table", () => {
 		["server 1.6.9 unforced", { server: server("1.6.9") }, "builtin", "superseded"],
 		["server 1.6.9 force", { server: server("1.6.9", { force: true }) }, "server", "waiting"],
 		["server unverified", { server: server("9.9.9", { verified: false, why: "signature invalid" }) }, "builtin", "rejected"],
-		["server minCore 2 (= this core)", { server: server("9.9.9", { minCore: 2 }) }, "server", "waiting"],
-		["server minCore 3", { server: server("9.9.9", { minCore: 3 }) }, "builtin", "rejected"],
+		["server minCore 2 (older core)", { server: server("9.9.9", { minCore: 2 }) }, "server", "waiting"],
+		["server minCore 3 (= this core)", { server: server("9.9.9", { minCore: 3 }) }, "server", "waiting"],
+		["server minCore 4", { server: server("9.9.9", { minCore: 4 }) }, "builtin", "rejected"],
 		["server bad n=2 fresh", { server: S, bad: { [S.id]: { n: 2, at: at(NOW - H), why: "throw" } } }, "builtin", "bad"],
 		["server bad n=2 aged 25 h", { server: S, bad: { [S.id]: { n: 2, at: at(NOW - 25 * H), why: "throw" } } }, "server", "waiting"],
 		["server bad n=1", { server: S, bad: { [S.id]: { n: 1, at: at(NOW), why: "crash" } } }, "server", "waiting"],
@@ -50,7 +51,7 @@ test("pick: the precedence table", () => {
 		assert.equal(p.serverState, serverState, `${name}: serverState`);
 	}
 	assert.equal(pick({ server: server("9.9.9", { verified: false, why: "signature invalid" }) }).why, "signature invalid");
-	assert.equal(pick({ server: server("9.9.9", { minCore: 3 }) }).why, "needs core ≥ 3");
+	assert.equal(pick({ server: server("9.9.9", { minCore: 4 }) }).why, "needs core ≥ 4");
 	assert.equal(pick({ safeMode: true }).why, "safe mode");
 });
 
@@ -175,10 +176,12 @@ test("loadStaged: nothing staged → null; verified only when manifest and bundl
 });
 
 test("evaluateApp: the module shape of the contract, with the given require", () => {
-	const mod = T.evaluateApp("const o = require('obsidian'); module.exports = { API: 1, createApp: () => o };", (id) => (id === "obsidian" ? { stub: true } : require(id)));
+	const mod = T.evaluateApp("const o = require('obsidian'); module.exports = { API: 2, createApp: () => o };", (id) => (id === "obsidian" ? { stub: true } : require(id)));
 	assert.deepEqual(mod.createApp(), { stub: true });
-	assert.throws(() => T.evaluateApp("module.exports = { API: 2, createApp() {} };", require), /API 2/);
-	assert.throws(() => T.evaluateApp("module.exports = { API: 1 };", require), /createApp/);
+	// A 1.9.x app.js (API 1) never runs on this core (F.1).
+	assert.throws(() => T.evaluateApp("module.exports = { API: 1, createApp() {} };", require), /API 1/);
+	assert.throws(() => T.evaluateApp("module.exports = { API: 3, createApp() {} };", require), /API 3/);
+	assert.throws(() => T.evaluateApp("module.exports = { API: 2 };", require), /createApp/);
 	assert.throws(() => T.evaluateApp("module.exports = {", require), SyntaxError);
 	assert.throws(() => T.evaluateApp("throw new Error('top level')", require), /top level/);
 });

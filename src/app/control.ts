@@ -25,10 +25,10 @@ import { CONTROL, Entry, parentOf } from "../shared/vaultfiles";
  * Nothing connects inbound to the laptop; the plugin polls over the same transport the
  * backup already uses, so if backups work, control works.
  *
- * A restore (restore-all, pull) that meets the hidden private folder never writes into it:
- * its private files are remembered in settings.restoreDeferred (saved before the command is
- * marked done) and written at the first reconcile after the next unlock, with the same rules
- * as the command itself. Until then the backup leaves everything under the private folder
+ * A restore (restore-all, pull) that runs while the private folder is locked writes none of its
+ * private files (not into the hidden folder, not visible beside it): they are remembered in
+ * settings.restoreDeferred (saved before the command is marked done) and written at the first
+ * reconcile after the next unlock, with the same rules as the command itself. Until then the backup leaves everything under the private folder
  * alone, so an older local note can never be uploaded over the newer server copy. The deferred
  * run clears its record after one complete pass: a file of its own that cannot be restored (a
  * stale index key, a server copy that changed, a name this disk refuses) is listed in the
@@ -88,7 +88,10 @@ export class Control {
 			settings: { idleMinutes: s.idleMinutes, lockOnBlur: s.lockOnBlur, reconcileMinutes: s.reconcileMinutes, excludes: s.excludes.split("\n").filter(Boolean), privateFolder: s.privateFolder },
 			commands: s.commandLog,
 			core: this.coreStatus(),
-			encryption: { ...this.owner.privateFolder.stats(), keyState: this.keyState, serverKeyId: this.serverKeyId, restoreDeferred: s.restoreDeferred.map((d) => d.id) },
+			encryption: {
+				...this.owner.privateFolder.stats(), keyState: this.keyState, serverKeyId: this.serverKeyId,
+				restoreDeferred: s.restoreDeferred.map((d) => d.id), fileRecovery: this.owner.fileRecovery,
+			},
 		};
 		await this.backup.ensureDir(CONTROL);
 		await this.backup.dav("PUT", STATUS, JSON.stringify(body, null, 2), { "Content-Type": "application/json" });
@@ -316,10 +319,10 @@ export class Control {
 		}
 	}
 
-	/** A restore wrote private files visible while the window is locked (no hidden folder before
-	 *  the restore, or a lock that landed during it): hide and encrypt them now. hide() merges a
-	 *  visible folder into the hidden one when both exist. A rename that fails is retried by the
-	 *  lock screen every HIDE_RETRY_MS and never fails the command: its files were written. */
+	/** A lock landed during a restore, between a file's last check and its write: hide and encrypt
+	 *  what was written visible. hide() merges a visible folder into the hidden one when both
+	 *  exist. A rename that fails is retried by the lock screen every HIDE_RETRY_MS and never
+	 *  fails the command: its files were written. */
 	private async hideIfLocked(): Promise<void> {
 		const wrote = this.wrotePrivate;
 		this.wrotePrivate = false;
@@ -339,7 +342,7 @@ export class Control {
 		const s = this.owner.settings;
 		const pf = this.owner.privateFolder;
 		if (!s.restoreDeferred.length || !pf.enabled) return;
-		if (await this.owner.app.vault.adapter.exists(pf.hiddenName)) return; // still locked: wait
+		if (await this.lockedNow()) return; // still locked: wait
 		this.wrotePrivate = false;
 		try {
 			for (const d of s.restoreDeferred.slice()) {
@@ -396,9 +399,10 @@ export class Control {
 		const adapter = this.owner.app.vault.adapter;
 		const pf = this.owner.privateFolder;
 		const isPrivate = pf.isPrivateServerPath(sp);
-		// Never into the hidden folder: it waits for the first reconcile after the unlock. While
-		// the folder is not hidden, the local path is the server path.
-		if (isPrivate && (await adapter.exists(pf.hiddenName))) return "deferred";
+		// Never while locked: not into the hidden folder, and not visible beside it or in its
+		// place (Obsidian would list the note until it is hidden). It waits for the first reconcile
+		// after the unlock. While unlocked, the local path is the server path.
+		if (isPrivate && (await this.lockedNow())) return "deferred";
 		const local = sp;
 		const st = await adapter.stat(local);
 		const haveLocal = !!st && st.type === "file";
@@ -423,9 +427,8 @@ export class Control {
 			await this.backup.ensureDir(parentOf(dest));
 			await this.backup.dav("PUT", dest, data, { "Content-Type": "application/octet-stream" });
 		}
-		// A lock may have landed since the check above (the GET and the park take time): never a
-		// readable copy beside the hidden folder, let alone inside it.
-		if (isPrivate && (await adapter.exists(pf.hiddenName))) return "deferred";
+		// A lock may have landed since the check above (the GET and the park take time).
+		if (isPrivate && (await this.lockedNow())) return "deferred";
 		try {
 			await this.mkdirs(parentOf(local));
 			await adapter.writeBinary(local, r.arrayBuffer, { mtime: e.m });
@@ -437,6 +440,13 @@ export class Control {
 		this.backup.touchManifest();
 		if (isPrivate) this.wrotePrivate = true;
 		return "written";
+	}
+
+	/** The private folder is locked: the user-facing state, or the hidden folder on disk (an
+	 *  unlock still decrypting, a stopped lock screen). */
+	private async lockedNow(): Promise<boolean> {
+		if (this.owner.lockScreen.locked) return true;
+		return this.owner.app.vault.adapter.exists(this.owner.privateFolder.hiddenName);
 	}
 
 	private async mkdirs(dir: string): Promise<void> {

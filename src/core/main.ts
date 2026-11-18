@@ -1,5 +1,6 @@
-import { Notice, Plugin, PluginSettingTab } from "obsidian";
+import { Notice, Plugin, PluginSettingTab, setIcon } from "obsidian";
 import type { App as ObsidianApp } from "obsidian";
+import * as fs from "fs";
 import * as path from "path";
 import { QUIT_WAIT_MS, STOP_TIMEOUT_MS, UNLOAD_COVER_MS } from "../shared/constants";
 import { withTimeout } from "../shared/dav";
@@ -8,9 +9,10 @@ import { Supervisor } from "./supervisor";
 
 /**
  * The core: the part of the plugin that rarely changes. It owns the settings (data.json and
- * its copy data.bak.json), the two commands, the setting tab and the fail-closed cover, and
- * runs one app (the built-in one, or the lifeboat) through the contract in
- * shared/contract.ts. The supervisor decides which, and keeps the backup going.
+ * its copy data.bak.json), the commands, the ribbon padlock, the setting tab and the
+ * fail-closed cover (only while the private folder is visible), and runs one app (the built-in
+ * one, or the lifeboat) through the contract in shared/contract.ts. The supervisor decides
+ * which, and keeps the backup going.
  */
 
 declare global {
@@ -25,6 +27,10 @@ export default class VaultLockPlugin extends Plugin {
 	settings!: VLBSettings;
 	/** Public for tests: supervisor.current is the running app, supervisor.tick() runs a core tick. */
 	supervisor: Supervisor = new Supervisor(this);
+	/** The ribbon padlock; public for tests. */
+	ribbon: HTMLElement | null = null;
+	/** What the padlock shows: true = closed (a click unlocks). setRibbon() is its only writer. */
+	uiLocked = true;
 	private unloaded = false;
 
 	get hasPass(): boolean {
@@ -39,22 +45,67 @@ export default class VaultLockPlugin extends Plugin {
 		return path.join(base, this.manifest.dir ?? this.app.vault.configDir + "/plugins/" + this.manifest.id);
 	}
 
+	/** The private folder is on disk under its visible name. Sync, so the cover can go up at
+	 *  once; same name rules as shared/privateFolder.ts. False when the vault is not on a local disk. */
+	privateVisible(): boolean {
+		const n = (this.settings?.privateFolder ?? "").trim().replace(/^\/+|\/+$/g, "");
+		if (!n || n.startsWith(".") || n.includes("/")) return false;
+		const adapter = this.app.vault.adapter as { getBasePath?: () => string };
+		const base = this.pluginDir && typeof adapter.getBasePath === "function" ? adapter.getBasePath() : "";
+		if (!base) return false;
+		try {
+			return fs.existsSync(path.join(base, n));
+		} catch {
+			return true; // cannot tell: cover
+		}
+	}
+
+	/** The padlock: closed while locked (click = unlock dialog), open while unlocked (click = lock). */
+	setRibbon(locked: boolean): void {
+		this.uiLocked = locked;
+		const r = this.ribbon;
+		if (!r) return;
+		try {
+			setIcon(r, locked ? "lock" : "lock-open");
+			r.setAttribute("aria-label", locked ? "Unlock private folder" : "Lock private folder");
+		} catch (e) {
+			console.warn("[VLB] could not update the ribbon padlock", e);
+		}
+	}
+
+	/** The ribbon click. Without a passphrase it asks for one. */
+	private toggle(): void {
+		const c = this.supervisor.current;
+		if (!c) return;
+		if (!this.hasPass) { c.changePassphrase(); return; }
+		const p = this.uiLocked ? c.unlock() : c.lock();
+		void Promise.resolve(p).catch((e) => console.error("[VLB] the padlock click failed", e));
+	}
+
 	async onload(): Promise<void> {
 		await this.loadSettings();
 		// Disabled again while it loaded: onunload has run, nothing here would ever be removed.
 		if (this.unloaded) return;
-		// Nothing of the vault shows until an app has locked it.
-		if (this.hasPass) this.supervisor.cover.show();
+		// A visible private folder shows nothing until an app has hidden it. A hidden one needs no
+		// cover: the rest of the vault stays usable while the app starts.
+		if (this.hasPass && this.privateVisible()) this.supervisor.cover.show();
 		await this.previousCopy();
 		if (this.unloaded) return;
+		// The previous copy may have shown the folder while this one waited. A cover it left over a
+		// hidden folder (1.9.x covered the window whenever it was locked) hides nothing: it goes now.
+		if (this.hasPass && this.privateVisible()) this.supervisor.cover.show();
+		else this.supervisor.cover.hide();
 		this.supervisor.loadState();
 
 		// Only the lock has commands. The backup runs by itself and is driven from the
 		// server (_control/commands.json); it shows nothing on this computer.
-		this.addCommand({ id: "lock", name: "Lock vault now", callback: () => void this.supervisor.current?.lock() });
+		this.addCommand({ id: "lock", name: "Lock private folder", callback: () => void this.supervisor.current?.lock() });
+		this.addCommand({ id: "unlock", name: "Unlock private folder", callback: () => void this.supervisor.current?.unlock() });
 		this.addCommand({ id: "change-passphrase", name: "Set or change passphrase", callback: () => this.supervisor.current?.changePassphrase() });
-		// A lock button in the left ribbon. Unlocking is the lock screen's own button.
-		this.addRibbonIcon("lock", "Lock vault now", () => void this.supervisor.current?.lock());
+		// The padlock in the left ribbon locks and unlocks. Its title stays fixed: Obsidian keys
+		// the item by it (and lists it under that name); the tooltip follows the state.
+		this.ribbon = this.addRibbonIcon("lock", "Vault Lock", () => this.toggle());
+		this.setRibbon(this.hasPass);
 		this.addSettingTab(new VLBSettingTab(this.app, this));
 		// Obsidian closing or reloading the window is not a crash of the app that runs.
 		this.registerDomEvent(window, "beforeunload", () => this.supervisor.cleanExit());
@@ -69,7 +120,7 @@ export default class VaultLockPlugin extends Plugin {
 			tasks.add(async () => {
 				try {
 					await current.lock();
-					await withTimeout(current.finishLock?.() ?? Promise.resolve(), QUIT_WAIT_MS, "finishing the lock");
+					await withTimeout(current.finishLock(), QUIT_WAIT_MS, "finishing the lock");
 				} catch (e) {
 					console.error("[VLB] locking at quit failed", e);
 				}
@@ -85,7 +136,9 @@ export default class VaultLockPlugin extends Plugin {
 	onunload(): void {
 		this.unloaded = true;
 		const S = this.supervisor;
-		const wasLocked = S.lockedNow() || S.cover.shown;
+		// A cover is left behind only when it, or the fallback overlay, was all that hid a visible
+		// private folder. A hidden folder needs none; an unlocked one neither (disable = unlock).
+		const expose = S.cover.shown || (this.hasPass && this.privateVisible() && S.lockedNow());
 		const stopping = S.shutdown();
 		window.__vaultLock = { ...window.__vaultLock, stopping };
 		void stopping.finally(() => {
@@ -94,7 +147,7 @@ export default class VaultLockPlugin extends Plugin {
 		const legacy = window.__vaultLockStopping;
 		window.__vaultLockStopping = legacy ? Promise.all([legacy, stopping]).then(() => {}) : stopping;
 		// A reload (a BRAT update) takes this cover over; a real disable shows the vault after a moment.
-		if (wasLocked) S.cover.leaveBehind(UNLOAD_COVER_MS);
+		if (expose) S.cover.leaveBehind(UNLOAD_COVER_MS);
 		else S.cover.hide();
 	}
 
@@ -137,6 +190,7 @@ export default class VaultLockPlugin extends Plugin {
 			? { id: vk.id, key: vk.key } : null;
 		this.settings.encrypt = typeof saved.encrypt === "boolean" ? saved.encrypt : true;
 		this.settings.restoreDeferred = Array.isArray(saved.restoreDeferred) ? (saved.restoreDeferred as unknown[]).filter(validDeferred) : [];
+		this.settings.recoveryPaths = Array.isArray(saved.recoveryPaths) ? (saved.recoveryPaths as unknown[]).filter((p): p is string => typeof p === "string" && !!p) : [];
 		if (restored) await this.saveSettings();
 	}
 
