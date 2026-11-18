@@ -291,7 +291,7 @@ vlb status > "$tmp/status"
 grep -q "published: app 1.9.2 .* -> plugin says: nothing yet (never checked in)" "$tmp/status" || { cat "$tmp/status"; fail "status: no published app line"; }
 grep -q "published: core 1.9.2 " "$tmp/status" || { cat "$tmp/status"; fail "status: no published core line"; }
 grep -q "SAFE MODE requested in config.json" "$tmp/status" || { cat "$tmp/status"; fail "status: no SAFE MODE line"; }
-! grep -q "encryption" "$tmp/status" || { cat "$tmp/status"; fail "status: an encryption line for a computer that never checked in"; }
+! grep -q "^    encryption" "$tmp/status" || { cat "$tmp/status"; fail "status: an encryption line for a computer that never checked in"; }
 ok "status without status.json"
 echo '{"at": "2026-11-05T00:00:00.000Z", "version": "1.6.2", "lastError": null}' > "$D/other-fedcba/_control/status.json"
 sha12=$(python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest()[:12])' "$APP/app.js")
@@ -560,5 +560,53 @@ grep -q "retired the oldest stranger quiet (d-$Q_ID); folder data/devices/quiet-
 [ -d "$D/another-bbbbbb" ] && [ -f "$D/another-bbbbbb/_control/vault-key.json" ] || fail "the new stranger was not accepted with a key"
 : > "$tmp/docker-calls"
 ok "a retired stranger that held nothing but its key copy leaves no folder; its master and its ban stay"
+
+# ---- the encryption default for new computers ---------------------------------------------
+# A computer that pairs gets {"encrypt": false} (or what vlb encrypt default says) before its login
+# works; a move keeps the folder's own choice and its other keys; a retired stranger whose
+# config.json holds only that switch still leaves no folder.
+PCFG="$D/another-bbbbbb/_control/config.json"
+[ "$(jget "$PCFG" 'j')" = '{"encrypt": false}' ] || fail "a new computer did not get encrypt: false at pairing: $(cat "$PCFG" 2>&1)"
+[ "$(mode "$PCFG")" = 644 ] || fail "the pairing config.json is not 644"
+[ "$(jget "$D/other-fedcba/_control/config.json" '[j["encrypt"], j["core"]["safeMode"]]')" = '[false, true]' ] \
+	|| fail "the move into a folder without a choice did not add encrypt: false, or lost its other keys: $(cat "$D/other-fedcba/_control/config.json")"
+vlb status > "$tmp/status-def"
+grep -qx "New computers: encryption off (vlb encrypt default on|off)" "$tmp/status-def" || fail "status does not show the encryption default"
+vlb encrypt default on > /dev/null
+[ "$(jget "$VLB_ROOT/state.json" 'j["encryptDefault"]')" = true ] || fail "encrypt default on was not saved"
+vlb status | grep -qx "New computers: encryption on (vlb encrypt default on|off)" || fail "status does not show the default on"
+[ "$(jget "$PCFG" 'j')" = '{"encrypt": false}' ] || fail "encrypt default changed a paired computer"
+S_ID=cccccccccccccccc
+printf '{"id": "%s", "hash": "%s", "name": "third", "user": "ci", "os": "linux", "plugin": "1.9.0"}' "$S_ID" "$HASH" > "$VLB_ROOT/inbox/$S_ID.json"
+process
+[ "$(jget "$D/third-cccccc/_control/config.json" 'j')" = '{"encrypt": true}' ] || fail "with default on, a new computer did not get encrypt: true"
+echo '{"encrypt": true, "idleMinutes": 4}' > "$D/other-fedcba/_control/config.json"
+vlb encrypt default off > /dev/null
+[ "$(jget "$VLB_ROOT/state.json" 'j["encryptDefault"]')" = false ] || fail "encrypt default off was not saved"
+vlb move test other-fedcba > /dev/null
+printf '{"id": "%s", "hash": "%s", "name": "test", "user": "ci", "os": "linux", "plugin": "1.9.0"}' "$T_ID" "$HASH" > "$VLB_ROOT/inbox/$T_ID.json"
+process
+[ "$(jget "$D/other-fedcba/_control/config.json" 'j')" = '{"encrypt": true, "idleMinutes": 4}' ] || fail "a move replaced the folder's own encryption choice: $(cat "$D/other-fedcba/_control/config.json")"
+refuses "encrypt default with --only" vlb encrypt default on --only test
+refuses "encrypt default with a bad word" vlb encrypt default maybe
+python3 - "$VLB_ROOT/state.json" <<'PY2'
+import json, sys
+s = json.load(open(sys.argv[1]))
+for d in s["devices"]:
+    if d["name"] == "another":
+        d["frozen"] = "2026-11-18T00:00:00Z"  # a frozen stranger is retired first
+json.dump(s, open(sys.argv[1], "w"), indent=2)
+PY2
+strangers=$(jget "$VLB_ROOT/state.json" 'len([d for d in j["devices"] if not d.get("mine")])')
+U_ID=dddddddddddddddd
+printf '{"id": "%s", "hash": "%s", "name": "fourth", "user": "ci", "os": "linux", "plugin": "1.9.0"}' "$U_ID" "$HASH" > "$VLB_ROOT/inbox/$U_ID.json"
+VLB_MAX_DEVICES="$strangers" python3 "$VLB" process > "$tmp/process.out" 2>&1 || { cat "$tmp/process.out"; fail "vlb process (full, 2) failed"; }
+[ ! -e "$D/another-bbbbbb" ] || fail "a retired stranger with only the pairing config.json kept its folder: $(find "$D/another-bbbbbb")"
+[ "$(jget "$D/fourth-dddddd/_control/config.json" 'j')" = '{"encrypt": false}' ] || fail "the fourth computer did not get encrypt: false"
+: > "$tmp/docker-calls"
+vlb encrypt default off > /dev/null
+vlb help | grep -q "vlb encrypt default on|off" || fail "help does not list encrypt default"
+no_docker "encrypt default"
+ok "new computers get the encryption default at pairing; moves keep a folder's choice; retiring still cleans up"
 
 echo "all round-trip checks passed"

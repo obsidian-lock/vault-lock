@@ -34,7 +34,7 @@ Elsewhere:
                              computer, made by vlb process when the computer pairs. Each is
                              copied to the computer's _control/vault-key.json (in the
                              snapshot), and the plugin (1.9.0 and later) encrypts the private
-                             folder with it while locked. A lost master comes back from that
+                             folder with it while locked, if encryption is on for it. A lost master comes back from that
                              copy; a key is never replaced or rotated
   /root/vault-lock-bundles/  the bundle archive: one folder per version with app.js and/or
                              main.js, the signed manifests as published, meta.json
@@ -52,9 +52,11 @@ Commands:
                              login), whether its folder has the copy, what the plugin
                              reports, and the .vlenc file format (to decrypt a file by hand)
   vlb encrypt on|off [--only COMPUTER]...
-                             on (the default): the plugin encrypts the private folder at
-                             each lock; off: it decrypts at the next unlock and later locks
-                             only hide (read within 10 minutes)
+                             on: the plugin encrypts the private folder at each lock; off:
+                             it decrypts at the next unlock and later locks only hide (read
+                             within 10 minutes)
+  vlb encrypt default on|off what a computer gets when it pairs (off until changed); changes
+                             no computer that is already paired
   vlb move COMPUTER FOLDER   that computer continues an existing folder (a new or
                              reinstalled laptop picks up an old backup); it pairs again
                              and gets the folder's files back before its first backup
@@ -441,6 +443,24 @@ def accept(state, req):
     })
     log(f"paired {req['name']} (user {req['user'] or '?'}, {req['os'] or '?'}) "
         f"as d-{req['id']} -> data/devices/{folder}" + (" (continued)" if move else ""))
+    encrypt_default(state, folder)
+
+
+def encrypt_default(state, folder):
+    """A computer that pairs gets the server's default for encryption (vlb encrypt default),
+    unless its folder's config.json already says (vlb move into an old folder keeps that
+    folder's choice). Written before its login works, so the plugin reads it at its first backup
+    run, before it can have the key. A failure is logged and never stops the pairing."""
+    path = os.path.join(DEVICES, folder, "_control", "config.json")
+    try:
+        cfg = as_dict(read_json(path))
+        if "encrypt" in cfg:
+            return
+        cfg["encrypt"] = bool(state.get("encryptDefault", False))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_json(path, cfg, 0o644)
+    except Exception as e:  # noqa: BLE001 (pairing goes on)
+        log(f"ERROR: could not write the encryption default to data/devices/{folder}: {e}")
 
 
 def retire_stranger(state):
@@ -463,6 +483,9 @@ def retire_stranger(state):
             p = os.path.join(folder, "_control", n)
             if os.path.exists(p):
                 os.remove(p)
+        p = os.path.join(folder, "_control", "config.json")
+        if set(as_dict(read_json(p))) == {"encrypt"}:
+            os.remove(p)  # only the encryption switch (the pairing default): not data
         if os.path.isdir(os.path.join(folder, "_control")):
             os.rmdir(os.path.join(folder, "_control"))
         os.rmdir(folder)
@@ -885,6 +908,8 @@ def cmd_status(state):
         print(f"Pairing: OPEN since {p.get('since')}{only}. Every computer that asks gets its own sealed folder.")
     else:
         print(f"Pairing: PAUSED since {p.get('since')}. New computers wait. Resume with: vlb open")
+    print(f"New computers: encryption {'on' if state.get('encryptDefault') else 'off'} "
+          f"(vlb encrypt default on|off)")
     waiting = len(os.listdir(INBOX)) if os.path.isdir(INBOX) else 0
     if waiting:
         print(f"Inbox: {waiting} request(s) waiting for the next run")
@@ -1320,8 +1345,15 @@ def cmd_safemode(state, args):
 
 def cmd_encrypt(state, args):
     words, _, only = options(args)
+    if words in (["default", "on"], ["default", "off"]) and not only:
+        state["encryptDefault"] = words[1] == "on"
+        save_state(state)
+        log(f"encryption default for new computers: {words[1]}")
+        print(f"Computers that pair from now on start with encryption {words[1]}. "
+              "Paired computers keep theirs (vlb encrypt on|off --only COMPUTER).")
+        return
     if words not in (["on"], ["off"]):
-        sys.exit("Usage: vlb encrypt on|off [--only COMPUTER]...")
+        sys.exit("Usage: vlb encrypt on|off [--only COMPUTER]...  or  vlb encrypt default on|off")
     on = words[0] == "on"
     devs, _ = targets(state, only)
     for d in devs:
